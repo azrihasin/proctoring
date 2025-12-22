@@ -19,10 +19,11 @@
     "vite": "^7.2.2"
   },
   "dependencies": {
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2",
     "@radix-ui/react-dialog": "^1.1.15",
-    "@tensorflow-models/blazeface": "^0.1.0",
     "@tensorflow-models/coco-ssd": "^2.2.3",
-    "@tensorflow/tfjs": "^4.22.0",
+    "@tensorflow/tfjs": "^4.21.0",
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
     "class-variance-authority": "^0.7.1",
