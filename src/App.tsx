@@ -3,6 +3,8 @@ import * as cocoSsd from '@tensorflow-models/coco-ssd'
 import '@tensorflow/tfjs' // Required for TensorFlow.js to work
 import Webcam from 'react-webcam'
 import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Textarea } from '@/components/ui/textarea'
 
 type DetectionType = 'cell_phone' | 'prohibited_object' | 'face_not_visible' | null
 
@@ -50,6 +52,14 @@ export default function App() {
   const examVideoChunksRef = useRef<Blob[]>([])
   const examMediaRecorderRef = useRef<MediaRecorder | null>(null)
   const [violations, setViolations] = useState<ViolationEntry[]>([])
+  
+  // UI state
+  const [isOverlayEnabled, setIsOverlayEnabled] = useState(true)
+  const [userNotActiveCount, setUserNotActiveCount] = useState(0)
+  const [logEntries, setLogEntries] = useState<string[]>([])
+  const [faceMonitoringResult, setFaceMonitoringResult] = useState<string>('No results selected.')
+  const [liveResults, setLiveResults] = useState<string>('No detection yet.')
+  const lastTabActivityRef = useRef<number>(Date.now())
 
   // Get video element from webcam ref
   const getVideoElement = () => {
@@ -175,6 +185,21 @@ export default function App() {
     }
   }, [isExamActive])
 
+  // Add log entry helper
+  const addLogEntry = useCallback((message: string) => {
+    const timestamp = new Date().toLocaleString('en-US', {
+      month: '2-digit',
+      day: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    })
+    const logMessage = `${timestamp} ${message}`
+    setLogEntries(prev => [...prev.slice(-99), logMessage]) // Keep last 100 entries
+  }, [])
+
   // Add violation to list when detected
   const addViolation = useCallback((type: DetectionType, score?: number) => {
     // For face_not_visible and cell_phone, track as duration - update existing or create new
@@ -220,6 +245,15 @@ export default function App() {
         const newViolations = [...prev, violation]
         // Set the active index to the new violation
         activeRef.current = newViolations.length - 1
+        
+        // Add log entry
+        const violationMessage = type === 'face_not_visible' 
+          ? 'Face Not Visible' 
+          : type === 'cell_phone'
+          ? `Cell Phone Detected (${((score || 0) * 100).toFixed(1)}%)`
+          : 'Violation Detected'
+        addLogEntry(violationMessage)
+        
         console.log(`📝 ${type === 'face_not_visible' ? 'Face not visible' : 'Cell phone'} violation started:`, violation)
         return newViolations
       })
@@ -238,9 +272,16 @@ export default function App() {
       }
 
       setViolations(prev => [...prev, violation])
+      
+      // Add log entry
+      const violationMessage = type === 'prohibited_object' 
+        ? 'Prohibited Object Detected'
+        : 'Violation Detected'
+      addLogEntry(violationMessage)
+      
       console.log('📝 Violation recorded:', violation)
     }
-  }, [])
+  }, [addLogEntry])
 
   const runCoco = async () => {
     try {
@@ -735,6 +776,69 @@ export default function App() {
     }
   }
 
+  // Track tab visibility for "User Not Active On Current Tab"
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        lastTabActivityRef.current = Date.now()
+      } else {
+        const inactiveTime = Date.now() - lastTabActivityRef.current
+        if (inactiveTime > 5000) { // 5 seconds threshold
+          setUserNotActiveCount(prev => prev + 1)
+          addLogEntry('User Not Active On Current Tab')
+        }
+        lastTabActivityRef.current = Date.now()
+      }
+    }
+
+    const handleFocus = () => {
+      lastTabActivityRef.current = Date.now()
+    }
+
+    const handleBlur = () => {
+      lastTabActivityRef.current = Date.now()
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    window.addEventListener('focus', handleFocus)
+    window.addEventListener('blur', handleBlur)
+
+    // Check periodically for tab inactivity
+    const inactivityInterval = setInterval(() => {
+      if (!document.hidden && Date.now() - lastTabActivityRef.current > 5000) {
+        setUserNotActiveCount(prev => prev + 1)
+        addLogEntry('User Not Active On Current Tab')
+        lastTabActivityRef.current = Date.now()
+      }
+    }, 10000) // Check every 10 seconds
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      window.removeEventListener('focus', handleFocus)
+      window.removeEventListener('blur', handleBlur)
+      clearInterval(inactivityInterval)
+    }
+  }, [addLogEntry])
+
+  // Update face monitoring and live results based on detections
+  useEffect(() => {
+    if (violations.length > 0) {
+      const latestViolation = violations[violations.length - 1]
+      if (latestViolation.type === 'face_not_visible') {
+        setFaceMonitoringResult('Face Not Visible Detected')
+        setLiveResults('Face Not Visible')
+      } else if (latestViolation.type === 'cell_phone') {
+        setFaceMonitoringResult('Cell Phone Detected')
+        setLiveResults(`Cell Phone Detected (${((latestViolation.score || 0) * 100).toFixed(1)}%)`)
+      } else if (latestViolation.type === 'prohibited_object') {
+        setFaceMonitoringResult('Prohibited Object Detected')
+        setLiveResults('Prohibited Object Detected')
+      }
+    } else {
+      setLiveResults('No detection yet.')
+    }
+  }, [violations])
+
   // Log detection history changes (for debugging/maintenance)
   useEffect(() => {
     if (detectionHistory.length > 0) {
@@ -775,119 +879,195 @@ export default function App() {
     }
   }, [])
 
+  // Calculate summary report stats
+  const faceNotCenteredCount = violations.filter(v => v.type === 'face_not_visible').length
+  const faceTooSmallCount = 0 // Placeholder
+  const noFaceDetectedCount = violations.filter(v => v.type === 'face_not_visible').length
+
   return (
-    <div className="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-      <div className="w-full max-w-4xl">
-        <div className="bg-white rounded-lg shadow-lg p-6">
-          <h1 className="text-2xl font-bold text-center mb-6 text-gray-800">
-            Proctoring System
+    <div className="min-h-screen bg-slate-50 p-4">
+      <div className="max-w-7xl mx-auto space-y-4">
+        {/* Header */}
+        <div className="text-center">
+          <h1 className="text-3xl font-bold text-gray-900">
+            Proctoring
           </h1>
-          
-          {/* Start/End Exam Buttons */}
-          <div className="flex justify-center gap-4 mb-4">
-            {!isExamActive ? (
-              <Button
-                onClick={handleStartExam}
-                disabled={!webcamReady || !modelsLoaded}
-                className="bg-green-600 text-white hover:bg-green-700 font-semibold h-10 px-6"
-              >
-                Start Exam
-              </Button>
-            ) : (
-              <Button
-                onClick={handleEndExam}
-                className="bg-red-600 text-white hover:bg-red-700 font-semibold h-10 px-6"
-              >
-                End Exam
-              </Button>
-            )}
-          </div>
-
-          {isExamActive && examStartTime && (
-            <div className="text-center mb-4">
-              <p className="text-green-600 font-semibold">
-                Exam in progress - Started at {examStartTime.toLocaleTimeString()}
-              </p>
-            </div>
-          )}
-
-          <div className="flex flex-col lg:flex-row justify-center gap-4 items-start">
-            <div className="relative w-full max-w-2xl aspect-video bg-black rounded-lg overflow-hidden flex-shrink-0">
-              {webcamError ? (
-                <div className="w-full h-full flex flex-col items-center justify-center text-white p-4">
-                  <p className="text-lg font-semibold mb-2">Camera Access Error</p>
-                  <p className="text-sm text-center">{webcamError}</p>
-                  <p className="text-xs text-center mt-2 text-gray-300">
-                    Please allow camera access and refresh the page.
-                  </p>
-                </div>
-              ) : (
-                <>
-                  <Webcam
-                    ref={webcamRef}
-                    audio={false}
-                    videoConstraints={{
-                      width: { ideal: 854, max: 854 },
-                      height: { ideal: 480, max: 480 },
-                      facingMode: 'user',
-                      frameRate: { ideal: 30, min: 24 },
-                    }}
-                    onUserMedia={handleUserMedia}
-                    onUserMediaError={handleUserMediaError}
-                    className="w-full h-full object-cover"
-                    mirrored={false}
-                  />
-                  {!webcamReady && !webcamError && (
-                    <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-50 text-white">
-                      <p>Requesting camera access...</p>
-                    </div>
-                  )}
-                </>
-              )}
-              <canvas
-                ref={canvasRef}
-                className="absolute top-0 left-0 w-full h-full pointer-events-none"
-                style={{
-                  zIndex: 10,
-                }}
-              />
-            </div>
-            
-            {/* Violations JSON Display */}
-            <div className="w-full lg:w-auto lg:max-w-md bg-gray-50 rounded-lg p-4 border border-gray-200 flex-shrink-0">
-              <h3 className="text-lg font-semibold mb-2 text-gray-800">Violations</h3>
-              {violations.length > 0 ? (
-                <div className="bg-white rounded p-3 border border-gray-300 max-h-96 overflow-y-auto">
-                  <pre className="text-xs text-gray-700 whitespace-pre-wrap">
-                    {JSON.stringify(violations, null, 2)}
-                  </pre>
-                </div>
-              ) : (
-                <div className="bg-white rounded p-3 border border-gray-300 text-sm text-gray-500 text-center">
-                  No violations recorded yet
-                </div>
-              )}
-            </div>
-          </div>
-          {!modelsLoaded && (
-            <p className="text-center mt-4 text-blue-600 font-semibold">
-              Loading detection models...
-            </p>
-          )}
-          {modelsLoaded && webcamReady && (
-            <div className="text-center mt-4">
-              {isExamActive ? (
-                <p className="text-green-600 font-semibold">
-                  Exam in progress - Violations are being recorded automatically
-                </p>
-              ) : (
-                <p className="text-gray-600">
-                  Detection active. Please keep your face visible and remove any prohibited items.
-                </p>
-              )}
-            </div>
-          )}
         </div>
+
+        {/* Action Bar */}
+        <div className="bg-green-100 rounded-lg p-4 flex justify-center gap-4">
+          <Button
+            onClick={() => {
+              if (!webcamReady) {
+                // Trigger webcam initialization
+                setWebcamReady(true)
+              }
+            }}
+            disabled={webcamReady}
+            className="bg-teal-600 hover:bg-teal-700 text-white font-semibold px-6 py-2"
+          >
+            ENABLE WEBCAM
+          </Button>
+          <Button
+            onClick={() => setIsOverlayEnabled(!isOverlayEnabled)}
+            className="bg-teal-600 hover:bg-teal-700 text-white font-semibold px-6 py-2"
+          >
+            {isOverlayEnabled ? 'DISABLE OVERLAY' : 'ENABLE OVERLAY'}
+          </Button>
+        </div>
+
+        {/* Three Column Layout */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {/* Left Panel - Face Monitoring */}
+          <Card className="bg-purple-50 border-purple-200">
+            <CardHeader>
+              <CardTitle className="text-lg font-bold text-gray-900">Face Monitoring</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm text-gray-700">{faceMonitoringResult}</p>
+            </CardContent>
+          </Card>
+
+          {/* Middle Panel - Video Feed */}
+          <Card className="bg-orange-50 border-orange-200">
+            <CardContent className="p-0">
+              <div className="relative w-full aspect-video bg-black rounded-lg overflow-hidden">
+                {webcamError ? (
+                  <div className="w-full h-full flex flex-col items-center justify-center text-white p-4">
+                    <p className="text-lg font-semibold mb-2">Camera Access Error</p>
+                    <p className="text-sm text-center">{webcamError}</p>
+                    <p className="text-xs text-center mt-2 text-gray-300">
+                      Please allow camera access and refresh the page.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <Webcam
+                      ref={webcamRef}
+                      audio={false}
+                      videoConstraints={{
+                        width: { ideal: 854, max: 854 },
+                        height: { ideal: 480, max: 480 },
+                        facingMode: 'user',
+                        frameRate: { ideal: 30, min: 24 },
+                      }}
+                      onUserMedia={handleUserMedia}
+                      onUserMediaError={handleUserMediaError}
+                      className="w-full h-full object-cover"
+                      mirrored={false}
+                    />
+                    {!webcamReady && !webcamError && (
+                      <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-50 text-white">
+                        <p>Requesting camera access...</p>
+                      </div>
+                    )}
+                  </>
+                )}
+                {isOverlayEnabled && (
+                  <canvas
+                    ref={canvasRef}
+                    className="absolute top-0 left-0 w-full h-full pointer-events-none"
+                    style={{ zIndex: 10 }}
+                  />
+                )}
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Right Panel - Summary Report */}
+          <Card className="bg-red-50 border-red-200">
+            <CardHeader>
+              <CardTitle className="text-lg font-bold text-gray-900">Summary Report</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              <div className="text-sm text-gray-700">
+                Face Not Centered: {faceNotCenteredCount > 0 ? faceNotCenteredCount : ''}
+              </div>
+              <div className="text-sm text-gray-700">
+                Face Appears Too Small: {faceTooSmallCount > 0 ? faceTooSmallCount : ''}
+              </div>
+              <div className="text-sm text-gray-700">
+                Under Development:
+              </div>
+              <div className="text-sm text-gray-700">
+                No Face Detected: {noFaceDetectedCount > 0 ? noFaceDetectedCount : ''}
+              </div>
+              <div className="text-sm text-gray-700">
+                User Not Active On Current Tab: {userNotActiveCount}
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Log Section */}
+        <Card className="border-green-200">
+          <div className="bg-green-100 rounded-t-lg p-3 border-b border-green-200">
+            <h2 className="text-lg font-bold text-gray-900">Log Section</h2>
+          </div>
+          <CardContent className="p-4">
+            <Textarea
+              readOnly
+              value={logEntries.join('\n')}
+              className="min-h-[200px] bg-white border-gray-300 font-mono text-xs"
+              placeholder="Log entries will appear here..."
+            />
+          </CardContent>
+        </Card>
+
+        {/* Snapshot Section */}
+        <Card className="border-purple-200">
+          <div className="bg-purple-100 rounded-t-lg p-3 border-b border-purple-200">
+            <h2 className="text-lg font-bold text-gray-900">Snapshot Section</h2>
+          </div>
+          <CardContent className="p-4">
+            <div className="min-h-[150px] bg-white border border-gray-300 rounded-md flex items-center justify-center">
+              <p className="text-gray-500 text-sm">No snapshots captured</p>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Bottom Section */}
+        <div className="flex justify-between items-start gap-4">
+          {/* Live Results Panel */}
+          <Card className="bg-purple-50 border-purple-200 flex-1 max-w-xs">
+            <CardHeader>
+              <CardTitle className="text-lg font-bold text-gray-900">Live Results</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm text-gray-700">{liveResults}</p>
+            </CardContent>
+          </Card>
+
+          {/* Navigation Buttons */}
+          <div className="flex gap-4 items-center">
+            <Button
+              className="bg-teal-600 hover:bg-teal-700 text-white font-semibold px-8 py-3"
+            >
+              Sebelum
+            </Button>
+            <Button
+              onClick={isExamActive ? handleEndExam : handleStartExam}
+              disabled={!webcamReady || !modelsLoaded}
+              className="bg-teal-600 hover:bg-teal-700 text-white font-semibold px-8 py-3"
+            >
+              TAMAT PEPERIKSAAN
+            </Button>
+          </div>
+        </div>
+
+        {/* Status Messages */}
+        {!modelsLoaded && (
+          <div className="text-center">
+            <p className="text-blue-600 font-semibold">Loading detection models...</p>
+          </div>
+        )}
+        {isExamActive && examStartTime && (
+          <div className="text-center">
+            <p className="text-green-600 font-semibold">
+              Exam in progress - Started at {examStartTime.toLocaleTimeString()}
+            </p>
+          </div>
+        )}
       </div>
     </div>
   )
