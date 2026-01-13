@@ -1,14 +1,11 @@
 import { useRef, useState, useEffect, useCallback } from 'react'
-import * as cocoSsd from '@tensorflow-models/coco-ssd'
-import '@tensorflow/tfjs' // Required for TensorFlow.js to work
+import { FaceDetector, HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision'
 import Webcam from 'react-webcam'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Textarea } from '@/components/ui/textarea'
 
-type DetectionType = 'cell_phone' | 'prohibited_object' | 'face_not_visible' | null
-
-type DetectionElement = { class: string; score: number; bbox: [number, number, number, number] }
+type DetectionType = 'cell_phone' | 'multiple_faces' | 'face_not_visible' | null
 
 type DetectionHistoryEntry = {
   type: DetectionType
@@ -35,16 +32,18 @@ export default function App() {
   const [webcamError, setWebcamError] = useState<string | null>(null)
   const [webcamReady, setWebcamReady] = useState(false)
   const detectionCountRef = useRef<{ type: DetectionType; count: number }>({ type: null, count: 0 })
-  const faceNotVisibleCountRef = useRef<number>(0) // Track consecutive frames without person detection
-  const modelRef = useRef<cocoSsd.ObjectDetection | null>(null)
+  const faceNotVisibleCountRef = useRef<number>(0) // Track consecutive frames without face detection
+  const faceDetectorRef = useRef<FaceDetector | null>(null)
+  const handLandmarkerRef = useRef<HandLandmarker | null>(null)
   const detectionIntervalRef = useRef<number | null>(null) // Store interval ID for detection
   
-  const cellPhoneDetectionDebounceRef = useRef<number | null>(null) // For 2s debounce
+  const cellPhoneDetectionDebounceRef = useRef<number | null>(null) // For debounce
   const lastCellPhoneDetectionTimeRef = useRef<number>(0)
   const latestDetectionScoreRef = useRef<{ type: DetectionType; score: number } | null>(null) // Store latest detection score for violations
   const [detectionHistory, setDetectionHistory] = useState<DetectionHistoryEntry[]>([])
   const activeFaceNotVisibleViolationRef = useRef<number | null>(null) // Index of active face_not_visible violation in violations array
   const activeCellPhoneViolationRef = useRef<number | null>(null) // Index of active cell_phone violation in violations array
+  const activeMultipleFacesViolationRef = useRef<number | null>(null) // Index of active multiple_faces violation in violations array
   
   // Exam recording state
   const [isExamActive, setIsExamActive] = useState(false)
@@ -114,6 +113,7 @@ export default function App() {
       setViolations([])
       activeFaceNotVisibleViolationRef.current = null // Reset active face_not_visible violation
       activeCellPhoneViolationRef.current = null // Reset active cell_phone violation
+      activeMultipleFacesViolationRef.current = null // Reset active multiple_faces violation
       examVideoChunksRef.current = []
 
       const options = { mimeType: RECORDING_MIME_TYPE, videoBitsPerSecond: 1500000 }
@@ -202,12 +202,14 @@ export default function App() {
 
   // Add violation to list when detected
   const addViolation = useCallback((type: DetectionType, score?: number) => {
-    // For face_not_visible and cell_phone, track as duration - update existing or create new
-    if (type === 'face_not_visible' || type === 'cell_phone') {
+    // For face_not_visible, cell_phone, and multiple_faces, track as duration - update existing or create new
+    if (type === 'face_not_visible' || type === 'cell_phone' || type === 'multiple_faces') {
       setViolations(prev => {
         const activeRef = type === 'face_not_visible' 
           ? activeFaceNotVisibleViolationRef 
-          : activeCellPhoneViolationRef
+          : type === 'cell_phone'
+          ? activeCellPhoneViolationRef
+          : activeMultipleFacesViolationRef
         
         // Check if there's an active violation of this type
         if (activeRef.current !== null) {
@@ -251,10 +253,12 @@ export default function App() {
           ? 'Face Not Visible' 
           : type === 'cell_phone'
           ? `Cell Phone Detected (${((score || 0) * 100).toFixed(1)}%)`
+          : type === 'multiple_faces'
+          ? 'Multiple Faces Detected'
           : 'Violation Detected'
         addLogEntry(violationMessage)
         
-        console.log(`📝 ${type === 'face_not_visible' ? 'Face not visible' : 'Cell phone'} violation started:`, violation)
+        console.log(`📝 ${type} violation started:`, violation)
         return newViolations
       })
     } else {
@@ -274,64 +278,74 @@ export default function App() {
       setViolations(prev => [...prev, violation])
       
       // Add log entry
-      const violationMessage = type === 'prohibited_object' 
-        ? 'Prohibited Object Detected'
-        : 'Violation Detected'
+      const violationMessage = 'Violation Detected'
       addLogEntry(violationMessage)
       
       console.log('📝 Violation recorded:', violation)
     }
   }, [addLogEntry])
 
-  const runCoco = async () => {
+  const loadMediaPipeModels = async () => {
     try {
-      console.log('Loading COCO-SSD model optimized for fast, instant, and accurate smartphone detection at 480p...')
+      console.log('Loading MediaPipe models for face and hand detection...')
       
-      // Using mobilenet_v2 for better accuracy while maintaining good speed
-      // This model offers significantly better accuracy than lite version for cell phone detection
-      // Optimized for fast, instant detection with high accuracy
-      const model = await cocoSsd.load({
-        base: 'mobilenet_v2', // Better accuracy for smartphone detection while maintaining good speed
+      // Initialize MediaPipe vision tasks
+      const vision = await FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
+      )
+      
+      // Load Face Detector
+      const faceDetector = await FaceDetector.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',
+          delegate: 'GPU'
+        },
+        runningMode: 'VIDEO',
+        minDetectionConfidence: 0.5,
+        minSuppressionThreshold: 0.3
       })
       
-      modelRef.current = model
-      console.log('✅ COCO-SSD model loaded successfully (mobilenet_v2 - optimized for fast, instant, and accurate smartphone detection)')
+      faceDetectorRef.current = faceDetector
+      console.log('✅ MediaPipe Face Detector loaded successfully')
+      
+      // Load Hand Landmarker
+      const handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+          delegate: 'GPU'
+        },
+        runningMode: 'VIDEO',
+        numHands: 2,
+        minHandDetectionConfidence: 0.5,
+        minHandPresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      })
+      
+      handLandmarkerRef.current = handLandmarker
+      console.log('✅ MediaPipe Hand Landmarker loaded successfully')
       
       setModelsLoaded(true)
 
-      // Start detection interval and store the ID
-      // Using 100ms interval for fast, instant detection (10 FPS detection rate)
-      // Optimized for speed while maintaining accuracy
+      // Start detection interval - 100ms for real-time detection (10 FPS)
       detectionIntervalRef.current = window.setInterval(() => {
-        detect()
+        detectWithMediaPipe()
       }, 100)
+      
+      console.log('✅ All MediaPipe models loaded successfully')
     } catch (error) {
-      console.error('Error loading COCO-SSD mobilenet_v2 model:', error)
-      // Fallback to lite_mobilenet_v2 if v2 fails
-      try {
-        console.log('Falling back to lite_mobilenet_v2...')
-        const model = await cocoSsd.load({
-          base: 'lite_mobilenet_v2',
-        })
-        modelRef.current = model
-        setModelsLoaded(true)
-        detectionIntervalRef.current = window.setInterval(() => {
-          detect()
-        }, 100)
-      } catch (fallbackError) {
-        console.error('Error loading fallback model:', fallbackError)
-      }
+      console.error('Error loading MediaPipe models:', error)
     }
   }
 
 
-  const detect = async () => {
+  const detectWithMediaPipe = async () => {
     const video = getVideoElement()
     
     if (
       video &&
       video.readyState === 4 &&
-      modelRef.current
+      faceDetectorRef.current &&
+      handLandmarkerRef.current
     ) {
       const videoWidth = video.videoWidth
       const videoHeight = video.videoHeight
@@ -344,291 +358,243 @@ export default function App() {
         canvasRef.current.height = videoHeight
 
         try {
-          // COCO-SSD handles preprocessing internally, just pass the video element
-          // Using mobilenet_v2 optimized for fast, instant, and accurate smartphone detection at 480p
-          // Parameters: maxNumBoxes, minScore
-          // Optimized minScore (35%) for faster detection while maintaining accuracy
-          const predictions = await modelRef.current.detect(video, 50, 0.35) // maxNumBoxes: 50, minScore: 0.35 (35% - optimized for fast detection)
+          const startTimeMs = performance.now()
           
-          // Convert COCO-SSD predictions to our format
-          // COCO-SSD returns: { bbox: [x, y, width, height], class: string, score: number }
-          // Our format expects: { class: string, score: number, bbox: [x, y, width, height] }
-          const obj: DetectionElement[] = predictions.map((pred: cocoSsd.DetectedObject) => ({
-            class: pred.class,
-            score: pred.score,
-            bbox: [
-              pred.bbox[0],      // x
-              pred.bbox[1],      // y
-              pred.bbox[2],      // width
-              pred.bbox[3]       // height
-            ] as [number, number, number, number]
-          }))
+          // Run MediaPipe Face Detection
+          const faceResults = faceDetectorRef.current.detectForVideo(video, startTimeMs)
+          
+          // Run MediaPipe Hand Detection
+          const handResults = handLandmarkerRef.current.detectForVideo(video, startTimeMs)
 
-            const ctx = canvasRef.current.getContext('2d')
-            if (ctx) {
-              // Clear canvas
-              ctx.clearRect(0, 0, videoWidth, videoHeight)
+          const ctx = canvasRef.current.getContext('2d')
+          if (ctx) {
+            // Clear canvas
+            ctx.clearRect(0, 0, videoWidth, videoHeight)
 
-              let person_count = 0
-              
-              // Minimum confidence threshold for person detection
-              const PERSON_CONFIDENCE_THRESHOLD = 0.60 // 60% confidence - higher accuracy with mobilenet_v2
+            const faceCount = faceResults.detections.length
+            
+            // Draw face detections
+            faceResults.detections.forEach((detection, index) => {
+              const bbox = detection.boundingBox
+              if (bbox) {
+                const x = bbox.originX
+                const y = bbox.originY
+                const width = bbox.width
+                const height = bbox.height
+                
+                // Different colors for single vs multiple faces
+                const boxColor = faceCount > 1 ? '#ff0000' : '#00ff00' // Red if multiple, green if single
+                
+                // Draw bounding box
+                ctx.strokeStyle = boxColor
+                ctx.lineWidth = 3
+                ctx.strokeRect(x, y, width, height)
+                
+                // Draw label background
+                ctx.fillStyle = boxColor
+                ctx.fillRect(x, y - 25, 180, 25)
+                
+                // Draw label text
+                ctx.fillStyle = '#ffffff'
+                ctx.font = '16px Arial'
+                const confidence = detection.categories && detection.categories[0] 
+                  ? (detection.categories[0].score * 100).toFixed(1) 
+                  : '0.0'
+                ctx.fillText(
+                  `Face ${index + 1} (${confidence}%)`,
+                  x + 5,
+                  y - 8
+                )
+              }
+            })
 
-              // First, check for person detection and draw bounding boxes
-              obj.forEach((element: DetectionElement) => {
-                // Only count persons with confidence above threshold
-                if (element.class === 'person' && element.score >= PERSON_CONFIDENCE_THRESHOLD) {
-                  person_count++
-                  
-                  // Bounding boxes are already scaled to video dimensions in postprocessOutput
-                  const [x, y, width, height] = element.bbox
-              
-                  // Draw bounding box for person
-                  ctx.strokeStyle = '#00ff00' // Green for person
-                  ctx.lineWidth = 3
-                  ctx.strokeRect(x, y, width, height)
-              
-                  // Draw label background
-                  ctx.fillStyle = '#00ff00'
-                  ctx.fillRect(x, y - 25, 150, 25)
-                  
-                  // Draw label text
-                  ctx.fillStyle = '#ffffff'
-                  ctx.font = '16px Arial'
-                  ctx.fillText(
-                    `Person (${(element.score * 100).toFixed(1)}%)`,
-                    x + 5,
-                    y - 8
-                  )
-                }
+            // Draw hand landmarks (for phone detection inference)
+            if (handResults.landmarks) {
+              handResults.landmarks.forEach((landmarks) => {
+                // Draw hand connections
+                ctx.strokeStyle = '#00ffff' // Cyan for hands
+                ctx.lineWidth = 2
+                
+                // Draw wrist point (landmark 0) prominently
+                const wrist = landmarks[0]
+                const wristX = wrist.x * videoWidth
+                const wristY = wrist.y * videoHeight
+                
+                ctx.fillStyle = '#00ffff'
+                ctx.beginPath()
+                ctx.arc(wristX, wristY, 5, 0, 2 * Math.PI)
+                ctx.fill()
+                
+                // Draw palm center approximation (average of key points)
+                const palmX = ((landmarks[0].x + landmarks[5].x + landmarks[17].x) / 3) * videoWidth
+                const palmY = ((landmarks[0].y + landmarks[5].y + landmarks[17].y) / 3) * videoHeight
+                
+                ctx.fillStyle = '#ffff00'
+                ctx.beginPath()
+                ctx.arc(palmX, palmY, 8, 0, 2 * Math.PI)
+                ctx.fill()
               })
+            }
 
-              // Draw bounding boxes for cell phones and prohibited objects
-              obj.forEach((element: DetectionElement) => {
-                // Skip person as it's already drawn above
-                if (element.class !== 'person') {
-                  // Bounding boxes are already scaled to video dimensions in postprocessOutput
-                  const [x, y, width, height] = element.bbox
-                  
-                  // Different colors for different object types
-                  let boxColor = '#ff6b00' // Default orange
-                  let labelColor = '#ff6b00'
-                  
-                  if (element.class === 'cell phone') {
-                    boxColor = '#ff0000' // Red for cell phone (more prominent)
-                    labelColor = '#ff0000'
-                  } else if (element.class === 'book') {
-                    boxColor = '#ff6b00' // Orange for prohibited objects
-                    labelColor = '#ff6b00'
-                  } else {
-                    boxColor = '#ffff00' // Yellow for other objects
-                    labelColor = '#ffff00'
-                  }
-                  
-                  // Draw bounding box
-                  ctx.strokeStyle = boxColor
-                  ctx.lineWidth = 4 // Thicker line for better visibility
-                  ctx.strokeRect(x, y, width, height)
-                  
-                  // Draw label background
-                  ctx.fillStyle = labelColor
-                  const labelWidth = Math.max(200, element.class.length * 10 + 80)
-                  ctx.fillRect(x, y - 30, labelWidth, 30)
-                  
-                  // Draw label text
-                  ctx.fillStyle = '#000000' // Black text for better contrast
-                  ctx.font = 'bold 16px Arial'
-                  ctx.fillText(
-                    `${element.class} (${(element.score * 100).toFixed(1)}%)`,
-                    x + 5,
-                    y - 10
-                  )
-                }
-              })
+            // Display detection status at top of canvas
+            if (faceCount > 1) {
+              ctx.fillStyle = '#ff0000'
+              ctx.fillRect(10, 10, 220, 40)
+              ctx.fillStyle = '#ffffff'
+              ctx.font = 'bold 18px Arial'
+              ctx.fillText(
+                `Multiple Faces: ${faceCount}`,
+                15,
+                35
+              )
+            } else if (faceCount === 1) {
+              ctx.fillStyle = '#00ff00'
+              ctx.fillRect(10, 10, 200, 40)
+              ctx.fillStyle = '#ffffff'
+              ctx.font = 'bold 18px Arial'
+              ctx.fillText(
+                `Face Detected`,
+                15,
+                35
+              )
+            }
 
-          // Display person count at top of canvas
-          if (person_count > 0) {
-            ctx.fillStyle = '#00ff00'
-            ctx.fillRect(10, 10, 200, 40)
-            ctx.fillStyle = '#ffffff'
-            ctx.font = 'bold 18px Arial'
-            ctx.fillText(
-              `Person Detected`,
-              15,
-              35
-            )
-          }
-
-          // Optimized thresholds for fast, instant, and accurate smartphone detection at 480p with 100ms intervals (10 FPS)
-          const CELL_PHONE_CONFIDENCE_THRESHOLD = 0.60 // 60% confidence - optimized for fast detection while maintaining accuracy
-          const PROHIBITED_OBJECT_CONFIDENCE_THRESHOLD = 0.60 // 60% confidence required
-          const REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE = 2 // Require only 2 consecutive detections (0.2 seconds at 100ms) - instant response
-          const REQUIRED_CONSECUTIVE_DETECTIONS = 3 // Require 3 consecutive detections (0.3 seconds at 100ms intervals)
-          const REQUIRED_CONSECUTIVE_FACE_MISSES = 20 // Require 20 consecutive frames without person (2.0 seconds at 100ms intervals) - reliable
-          const CELL_PHONE_DEBOUNCE_MS = 1000 // 1 second debounce for cell phone detections - faster repeated alerts
+          // Detection thresholds for MediaPipe
+          const REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE = 5 // 5 frames (0.5 seconds)
+          const REQUIRED_CONSECUTIVE_DETECTIONS_MULTIPLE_FACES = 10 // 10 frames (1.0 second)
+          const REQUIRED_CONSECUTIVE_FACE_MISSES = 20 // 20 frames (2.0 seconds)
+          const CELL_PHONE_DEBOUNCE_MS = 1000 // 1 second debounce
           
           let currentDetection: DetectionType = null
           
-          // First pass: find the highest confidence cell phone detection
-          let bestCellPhoneDetection: { score: number; element: DetectionElement } | null = null
-          
-          // Log all detections for debugging (only first few frames to avoid spam)
-          const shouldLogAllDetections = Math.random() < 0.05 // Log 5% of frames
-          if (shouldLogAllDetections && obj.length > 0) {
-            console.log('🔍 All detections:', obj.map(d => `${d.class} (${(d.score * 100).toFixed(1)}%)`).join(', '))
-          }
-          
-          for (const element of obj) {
-            // Cell phone detection with strict validation (always check, even if face not visible)
-            const className = element.class.toLowerCase().trim()
-            
-            // Strict matching - only accept exact 'cell phone' class name
-            const isCellPhone = className === 'cell phone'
-            
-            if (isCellPhone) {
-              // Additional validation: Check bounding box characteristics typical of cell phones
-              const [, , width, height] = element.bbox
-              const area = width * height
-              const aspectRatio = width / height
-              const videoArea = videoWidth * videoHeight
-              const relativeArea = area / videoArea
+          // Detect smartphone usage via hand positions
+          // When someone holds a phone, typically both hands are close together near face level
+          let isPhonePostureDetected = false
+          if (handResults.landmarks && handResults.landmarks.length >= 1) {
+            handResults.landmarks.forEach((landmarks) => {
+              // Get wrist position (landmark 0)
+              const wrist = landmarks[0]
+              const wristY = wrist.y * videoHeight
               
-              // Cell phones typically have:
-              // - Aspect ratio between 0.35 and 3.2 (portrait or landscape, realistic phone shapes)
-              // - Reasonable size (0.2% to 25% of frame for 480p detection - optimized for faster detection)
-              // - Good confidence score (mobilenet_v2 provides more reliable scores)
-              const isValidCellPhoneSize = relativeArea >= 0.002 && relativeArea <= 0.25 // 0.2% to 25% of frame (optimized for faster detection)
-              const isValidAspectRatio = aspectRatio >= 0.35 && aspectRatio <= 3.2 // More realistic phone aspect ratios
-              const hasHighConfidence = element.score >= 0.40 // Minimum 40% initial confidence (optimized for faster detection)
+              // Check if hand is in the upper 60% of frame (likely near face for phone use)
+              const isNearFaceLevel = wristY < videoHeight * 0.6
               
-              if (isValidCellPhoneSize && isValidAspectRatio && hasHighConfidence) {
-                // Log cell phone detections occasionally for debugging (reduce console spam)
-                if (Math.random() < 0.2) { // Log 20% of detections
-                  console.log(`📱 Cell phone detected: "${element.class}" confidence: ${(element.score * 100).toFixed(1)}% (area: ${(relativeArea * 100).toFixed(2)}%, aspect: ${aspectRatio.toFixed(2)})`)
-                }
+              // If hand is near face level and in phone-holding posture
+              if (isNearFaceLevel) {
+                isPhonePostureDetected = true
                 
-                // Track the best (highest confidence) cell phone detection
-                if (!bestCellPhoneDetection || element.score > bestCellPhoneDetection.score) {
-                  bestCellPhoneDetection = { score: element.score, element }
+                if (Math.random() < 0.05) { // Log 5% of detections
+                  console.log(`📱 Phone-holding posture detected (hand at y=${wristY.toFixed(0)})`)
                 }
-              } else {
-                // Log filtered detections occasionally for debugging
-                if (element.score >= 0.60 && Math.random() < 0.1) { // Log 10% of filtered detections
-                  console.log(`⚠️ Cell phone filtered: ${(element.score * 100).toFixed(1)}%, validSize=${isValidCellPhoneSize}, validAspect=${isValidAspectRatio}`)
+              }
+            })
+            
+            // If both hands detected and close together, higher confidence of phone use
+            if (handResults.landmarks.length === 2) {
+              const hand1Wrist = handResults.landmarks[0][0]
+              const hand2Wrist = handResults.landmarks[1][0]
+              
+              const hand1X = hand1Wrist.x * videoWidth
+              const hand1Y = hand1Wrist.y * videoHeight
+              const hand2X = hand2Wrist.x * videoWidth
+              const hand2Y = hand2Wrist.y * videoHeight
+              
+              const distance = Math.sqrt(Math.pow(hand1X - hand2X, 2) + Math.pow(hand1Y - hand2Y, 2))
+              const maxDistance = videoWidth * 0.3 // Within 30% of frame width
+              
+              if (distance < maxDistance) {
+                isPhonePostureDetected = true
+                
+                if (Math.random() < 0.05) { // Log 5% of detections
+                  console.log(`📱 Both hands close together (distance=${distance.toFixed(0)}px) - strong phone indicator`)
                 }
               }
             }
           }
           
-          // Use the best cell phone detection if it meets the threshold
-          if (bestCellPhoneDetection !== null) {
-            if (bestCellPhoneDetection.score >= CELL_PHONE_CONFIDENCE_THRESHOLD) {
-              // Always set currentDetection for tracking (debounce will be applied when triggering alert)
-              if (!currentDetection) {
-                currentDetection = 'cell_phone'
-                // Store latest detection score for violation recording
-                latestDetectionScoreRef.current = { type: 'cell_phone', score: bestCellPhoneDetection.score }
-                console.log(`✅ Cell phone detection tracked (confidence: ${(bestCellPhoneDetection.score * 100).toFixed(1)}%, threshold: ${(CELL_PHONE_CONFIDENCE_THRESHOLD * 100).toFixed(0)}%)`)
-                
-                // Add to detection history
-                setDetectionHistory(prev => {
-                  const updated = [
-                    ...prev,
-                    {
-                      type: 'cell_phone' as DetectionType,
-                      timestamp: new Date(),
-                      score: bestCellPhoneDetection.score
-                    }
-                  ]
-                  // Keep only last 100 entries for memory management
-                  return updated.slice(-100)
-                })
-              }
-            } else if (bestCellPhoneDetection.score < CELL_PHONE_CONFIDENCE_THRESHOLD) {
-              console.log(`⚠️ Cell phone detected but below threshold: ${(bestCellPhoneDetection.score * 100).toFixed(1)}% < ${(CELL_PHONE_CONFIDENCE_THRESHOLD * 100).toFixed(0)}%`)
-              // End cell phone violation if it was active
-              if (activeCellPhoneViolationRef.current !== null) {
-                setViolations(prev => {
-                  const activeIndex = activeCellPhoneViolationRef.current
-                  if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'cell_phone') {
-                    const updated = [...prev]
-                    updated[activeIndex] = {
-                      ...updated[activeIndex],
-                      endTime: new Date() // Final end time when cell phone no longer detected
-                    }
-                    console.log('✅ Cell phone violation ended (no longer detected)')
-                    return updated
-                  }
-                  return prev
-                })
-                activeCellPhoneViolationRef.current = null
-              }
-            }
-          } else {
-            // No cell phone detected - end active violation if exists
-            if (activeCellPhoneViolationRef.current !== null) {
-              setViolations(prev => {
-                const activeIndex = activeCellPhoneViolationRef.current
-                if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'cell_phone') {
-                  const updated = [...prev]
-                  updated[activeIndex] = {
-                    ...updated[activeIndex],
-                    endTime: new Date() // Final end time when cell phone no longer detected
-                  }
-                  console.log('✅ Cell phone violation ended (no longer detected)')
-                  return updated
+          // Set cell phone detection if phone posture detected
+          if (isPhonePostureDetected && !currentDetection) {
+            currentDetection = 'cell_phone'
+            latestDetectionScoreRef.current = { type: 'cell_phone', score: 0.8 }
+            
+            // Add to detection history
+            setDetectionHistory(prev => {
+              const updated = [
+                ...prev,
+                {
+                  type: 'cell_phone' as DetectionType,
+                  timestamp: new Date(),
+                  score: 0.8
                 }
-                return prev
-              })
-              activeCellPhoneViolationRef.current = null
-            }
-            // Log when we're looking for phones but not finding any (occasionally)
-            if (Math.random() < 0.01) { // Log 1% of frames
-              console.log('🔍 Scanning for cell phones... (no detections in this frame)')
-            }
+              ]
+              return updated.slice(-100)
+            })
+          } else if (!isPhonePostureDetected && activeCellPhoneViolationRef.current !== null) {
+            // End cell phone violation if no longer detected
+            setViolations(prev => {
+              const activeIndex = activeCellPhoneViolationRef.current
+              if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'cell_phone') {
+                const updated = [...prev]
+                updated[activeIndex] = {
+                  ...updated[activeIndex],
+                  endTime: new Date()
+                }
+                console.log('✅ Cell phone violation ended (no phone posture detected)')
+                return updated
+              }
+              return prev
+            })
+            activeCellPhoneViolationRef.current = null
           }
-          
-          obj.forEach((element: DetectionElement) => {
 
-            // Prohibited object detection (books, etc.)
-            // Only trigger if confidence is above threshold
-            if (element.class === 'book' && element.score >= PROHIBITED_OBJECT_CONFIDENCE_THRESHOLD && !currentDetection) {
-              currentDetection = 'prohibited_object'
-              // Store latest detection score for violation recording
-              latestDetectionScoreRef.current = { type: 'prohibited_object', score: element.score }
-            }
-          })
+          // Check for multiple faces
+          if (faceCount > 1 && !currentDetection) {
+            currentDetection = 'multiple_faces'
+            latestDetectionScoreRef.current = { type: 'multiple_faces', score: faceCount }
+            console.log(`👥 Multiple faces detected: ${faceCount}`)
+          } else if (faceCount <= 1 && activeMultipleFacesViolationRef.current !== null) {
+            // End multiple faces violation
+            setViolations(prev => {
+              const activeIndex = activeMultipleFacesViolationRef.current
+              if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'multiple_faces') {
+                const updated = [...prev]
+                updated[activeIndex] = {
+                  ...updated[activeIndex],
+                  endTime: new Date()
+                }
+                console.log('✅ Multiple faces violation ended')
+                return updated
+              }
+              return prev
+            })
+            activeMultipleFacesViolationRef.current = null
+          }
 
-          // Check if no person detected - face not visible (only if no other violations)
-          // Use a more lenient approach: require multiple consecutive misses before alerting
-          if (person_count === 0 && !currentDetection) {
-            // Increment the counter for consecutive frames without person
+          // Check for face not visible
+          if (faceCount === 0 && !currentDetection) {
             faceNotVisibleCountRef.current++
             
-            // Only set currentDetection if we've had enough consecutive misses
-            // This will then go through the consecutive detection tracking below
             if (faceNotVisibleCountRef.current >= REQUIRED_CONSECUTIVE_FACE_MISSES) {
               currentDetection = 'face_not_visible'
-              // Store latest detection score for violation recording (no score for face_not_visible)
               latestDetectionScoreRef.current = { type: 'face_not_visible', score: 0 }
-              console.log(`⚠️ Face not visible condition met after ${faceNotVisibleCountRef.current} consecutive misses`)
+              
+              if (faceNotVisibleCountRef.current === REQUIRED_CONSECUTIVE_FACE_MISSES) {
+                console.log(`⚠️ Face not visible condition met after ${faceNotVisibleCountRef.current} consecutive misses`)
+              }
             } else {
-              // Log progress but don't trigger yet
-              if (faceNotVisibleCountRef.current % 2 === 0) { // Log every 2 frames to reduce console spam
-                console.log(`👤 No person detected (${faceNotVisibleCountRef.current}/${REQUIRED_CONSECUTIVE_FACE_MISSES} frames)`)
+              if (faceNotVisibleCountRef.current % 10 === 0) { // Log every 10 frames
+                console.log(`👤 No face detected (${faceNotVisibleCountRef.current}/${REQUIRED_CONSECUTIVE_FACE_MISSES} frames)`)
               }
             }
-          } else if (person_count > 0) {
-            // Reset counter if person is detected
+          } else if (faceCount > 0) {
             if (faceNotVisibleCountRef.current > 0) {
-              const personDetection = obj.find(e => e.class === 'person')
-              console.log(`✅ Person detected (confidence: ${personDetection?.score.toFixed(2) || 'N/A'}), resetting face visibility counter (was at ${faceNotVisibleCountRef.current})`)
+              console.log(`✅ Face detected, resetting face visibility counter (was at ${faceNotVisibleCountRef.current})`)
             }
             faceNotVisibleCountRef.current = 0
-            // Also reset detection count if we were tracking face_not_visible
+            
             if (detectionCountRef.current.type === 'face_not_visible') {
               detectionCountRef.current = { type: null, count: 0 }
-              // End the active face_not_visible violation by updating its end time one final time
+              
               if (activeFaceNotVisibleViolationRef.current !== null) {
                 setViolations(prev => {
                   const activeIndex = activeFaceNotVisibleViolationRef.current
@@ -636,7 +602,7 @@ export default function App() {
                     const updated = [...prev]
                     updated[activeIndex] = {
                       ...updated[activeIndex],
-                      endTime: new Date() // Final end time when face becomes visible
+                      endTime: new Date()
                     }
                     console.log('✅ Face not visible violation ended (face detected)')
                     return updated
@@ -650,10 +616,8 @@ export default function App() {
 
           // Track consecutive detections to reduce false positives
           if (currentDetection === detectionCountRef.current.type) {
-            // Same detection type, increment count
             detectionCountRef.current.count++
           } else {
-            // Different detection type or no detection, reset count
             // End active violations if switching to a different type
             if (detectionCountRef.current.type === 'cell_phone' && activeCellPhoneViolationRef.current !== null) {
               setViolations(prev => {
@@ -662,7 +626,7 @@ export default function App() {
                   const updated = [...prev]
                   updated[activeIndex] = {
                     ...updated[activeIndex],
-                    endTime: new Date() // Final end time when detection type changes
+                    endTime: new Date()
                   }
                   console.log('✅ Cell phone violation ended (detection type changed)')
                   return updated
@@ -671,23 +635,39 @@ export default function App() {
               })
               activeCellPhoneViolationRef.current = null
             }
+            
+            if (detectionCountRef.current.type === 'multiple_faces' && activeMultipleFacesViolationRef.current !== null) {
+              setViolations(prev => {
+                const activeIndex = activeMultipleFacesViolationRef.current
+                if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'multiple_faces') {
+                  const updated = [...prev]
+                  updated[activeIndex] = {
+                    ...updated[activeIndex],
+                    endTime: new Date()
+                  }
+                  console.log('✅ Multiple faces violation ended (detection type changed)')
+                  return updated
+                }
+                return prev
+              })
+              activeMultipleFacesViolationRef.current = null
+            }
+            
             detectionCountRef.current.type = currentDetection
             detectionCountRef.current.count = currentDetection ? 1 : 0
           }
 
-            // Only trigger violation after required consecutive detections
+          // Only trigger violation after required consecutive detections
           const confirmedDetection = detectionCountRef.current.type
-          // Different consecutive requirements for different violation types
           const requiredConsecutive = confirmedDetection === 'cell_phone' 
             ? REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE 
-            : (confirmedDetection === 'face_not_visible' 
-              ? REQUIRED_CONSECUTIVE_DETECTIONS 
-              : REQUIRED_CONSECUTIVE_DETECTIONS)
+            : confirmedDetection === 'multiple_faces'
+            ? REQUIRED_CONSECUTIVE_DETECTIONS_MULTIPLE_FACES
+            : REQUIRED_CONSECUTIVE_FACE_MISSES
           
-          // Check if we have enough consecutive detections
           const hasEnoughConsecutiveDetections = detectionCountRef.current.count >= requiredConsecutive && !!confirmedDetection
           
-          // For cell phones, also check debounce (2 seconds since last alert)
+          // For cell phones, also check debounce
           let shouldTriggerAlert: boolean = hasEnoughConsecutiveDetections
           if (confirmedDetection === 'cell_phone' && hasEnoughConsecutiveDetections) {
             const now = Date.now()
@@ -695,83 +675,87 @@ export default function App() {
             shouldTriggerAlert = timeSinceLastDetection >= CELL_PHONE_DEBOUNCE_MS
             
             if (!shouldTriggerAlert) {
-              console.log(`⏱️ Cell phone alert debounced (${(timeSinceLastDetection / 1000).toFixed(1)}s < ${(CELL_PHONE_DEBOUNCE_MS / 1000).toFixed(0)}s since last alert)`)
+              console.log(`⏱️ Cell phone alert debounced (${(timeSinceLastDetection / 1000).toFixed(1)}s < ${(CELL_PHONE_DEBOUNCE_MS / 1000).toFixed(0)}s)`)
             }
           }
           
           if (shouldTriggerAlert) {
-            const detectionTypeStr = confirmedDetection as string
-            
             // Log violation
-            if (detectionTypeStr === 'cell_phone') {
-              // For cell_phone, we update the duration continuously
-              // Only log on first trigger, subsequent updates happen silently
+            if (confirmedDetection === 'cell_phone') {
               if (activeCellPhoneViolationRef.current === null) {
                 console.log('⚠️ VIOLATION TRIGGERED: Cell Phone Detected!')
               }
-              lastCellPhoneDetectionTimeRef.current = Date.now() // Update last detection time
-            } else if (detectionTypeStr === 'prohibited_object') {
-              console.log('⚠️ VIOLATION TRIGGERED: Prohibited Object Detected!')
-            } else if (detectionTypeStr === 'face_not_visible') {
-              // For face_not_visible, we update the duration continuously
-              // Only log on first trigger, subsequent updates happen silently
+              lastCellPhoneDetectionTimeRef.current = Date.now()
+            } else if (confirmedDetection === 'multiple_faces') {
+              if (activeMultipleFacesViolationRef.current === null) {
+                console.log('⚠️ VIOLATION TRIGGERED: Multiple Faces Detected!')
+              }
+            } else if (confirmedDetection === 'face_not_visible') {
               if (activeFaceNotVisibleViolationRef.current === null) {
                 console.log('⚠️ VIOLATION TRIGGERED: Face Not Visible!')
               }
             }
 
-            // Always record violation to list (whether in exam mode or not)
             if (confirmedDetection) {
               const violationScore = latestDetectionScoreRef.current?.type === confirmedDetection
                 ? latestDetectionScoreRef.current.score
                 : undefined
               
-              // For face_not_visible and cell_phone, continuously update the violation duration
-              if (confirmedDetection === 'face_not_visible' || confirmedDetection === 'cell_phone') {
+              // Continuously update violation duration for these types
+              if (confirmedDetection === 'face_not_visible' || confirmedDetection === 'cell_phone' || confirmedDetection === 'multiple_faces') {
                 addViolation(confirmedDetection, violationScore)
-                // Don't reset count - keep tracking to update duration
               } else {
                 addViolation(confirmedDetection, violationScore)
-                // Reset detection count after recording violation (for other types)
                 detectionCountRef.current.count = 0
               }
             }
           } else if (confirmedDetection === 'face_not_visible' && activeFaceNotVisibleViolationRef.current !== null) {
-            // Face is still not visible, update the end time of the active violation
             setViolations(prev => {
               const activeIndex = activeFaceNotVisibleViolationRef.current
               if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'face_not_visible') {
                 const updated = [...prev]
                 updated[activeIndex] = {
                   ...updated[activeIndex],
-                  endTime: new Date() // Continuously update end time
+                  endTime: new Date()
                 }
                 return updated
               }
               return prev
             })
           } else if (confirmedDetection === 'cell_phone' && activeCellPhoneViolationRef.current !== null) {
-            // Cell phone is still detected, update the end time of the active violation
             setViolations(prev => {
               const activeIndex = activeCellPhoneViolationRef.current
               if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'cell_phone') {
                 const updated = [...prev]
                 updated[activeIndex] = {
                   ...updated[activeIndex],
-                  endTime: new Date(), // Continuously update end time
+                  endTime: new Date(),
                   score: latestDetectionScoreRef.current?.type === 'cell_phone' 
                     ? latestDetectionScoreRef.current.score 
-                    : updated[activeIndex].score // Update score if available
+                    : updated[activeIndex].score
+                }
+                return updated
+              }
+              return prev
+            })
+          } else if (confirmedDetection === 'multiple_faces' && activeMultipleFacesViolationRef.current !== null) {
+            setViolations(prev => {
+              const activeIndex = activeMultipleFacesViolationRef.current
+              if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'multiple_faces') {
+                const updated = [...prev]
+                updated[activeIndex] = {
+                  ...updated[activeIndex],
+                  endTime: new Date()
                 }
                 return updated
               }
               return prev
             })
           }
-            } // Close ctx if statement
-          } catch (error) {
-            console.error('Error during COCO-SSD inference:', error)
-          }
+          } // Close ctx if statement
+        } catch (error) {
+          console.error('Error during MediaPipe detection:', error)
+        }
       } // Close canvasRef.current if statement
     }
   }
@@ -830,9 +814,9 @@ export default function App() {
       } else if (latestViolation.type === 'cell_phone') {
         setFaceMonitoringResult('Cell Phone Detected')
         setLiveResults(`Cell Phone Detected (${((latestViolation.score || 0) * 100).toFixed(1)}%)`)
-      } else if (latestViolation.type === 'prohibited_object') {
-        setFaceMonitoringResult('Prohibited Object Detected')
-        setLiveResults('Prohibited Object Detected')
+      } else if (latestViolation.type === 'multiple_faces') {
+        setFaceMonitoringResult('Multiple Faces Detected')
+        setLiveResults(`Multiple Faces Detected (${latestViolation.score || 0} faces)`)
       }
     } else {
       setLiveResults('No detection yet.')
@@ -848,7 +832,7 @@ export default function App() {
   }, [detectionHistory])
 
   useEffect(() => {
-    runCoco()
+    loadMediaPipeModels()
 
     // Cleanup on unmount
     return () => {
@@ -863,6 +847,16 @@ export default function App() {
       if (cellPhoneDetectionDebounceRef.current) {
         clearTimeout(cellPhoneDetectionDebounceRef.current)
         cellPhoneDetectionDebounceRef.current = null
+      }
+      
+      // Clean up MediaPipe detectors
+      if (faceDetectorRef.current) {
+        faceDetectorRef.current.close()
+        faceDetectorRef.current = null
+      }
+      if (handLandmarkerRef.current) {
+        handLandmarkerRef.current.close()
+        handLandmarkerRef.current = null
       }
       
       // Stop exam recording if active
