@@ -54,9 +54,7 @@ export default function App() {
   
   // UI state
   const [isOverlayEnabled, setIsOverlayEnabled] = useState(true)
-  const [userNotActiveCount, setUserNotActiveCount] = useState(0)
   const [logEntries, setLogEntries] = useState<string[]>([])
-  const [faceMonitoringResult, setFaceMonitoringResult] = useState<string>('No results selected.')
   const [liveResults, setLiveResults] = useState<string>('No detection yet.')
   const lastTabActivityRef = useRef<number>(Date.now())
 
@@ -800,7 +798,6 @@ export default function App() {
       } else {
         const inactiveTime = Date.now() - lastTabActivityRef.current
         if (inactiveTime > 5000) { // 5 seconds threshold
-          setUserNotActiveCount(prev => prev + 1)
           addLogEntry('User Not Active On Current Tab')
         }
         lastTabActivityRef.current = Date.now()
@@ -822,7 +819,6 @@ export default function App() {
     // Check periodically for tab inactivity
     const inactivityInterval = setInterval(() => {
       if (!document.hidden && Date.now() - lastTabActivityRef.current > 5000) {
-        setUserNotActiveCount(prev => prev + 1)
         addLogEntry('User Not Active On Current Tab')
         lastTabActivityRef.current = Date.now()
       }
@@ -836,18 +832,15 @@ export default function App() {
     }
   }, [addLogEntry])
 
-  // Update face monitoring and live results based on detections
+  // Update live results based on detections
   useEffect(() => {
     if (violations.length > 0) {
       const latestViolation = violations[violations.length - 1]
       if (latestViolation.type === 'face_not_visible') {
-        setFaceMonitoringResult('Face Not Visible Detected')
         setLiveResults('Face Not Visible')
       } else if (latestViolation.type === 'cell_phone') {
-        setFaceMonitoringResult('Cell Phone Detected')
         setLiveResults(`Cell Phone Detected (${((latestViolation.score || 0) * 100).toFixed(1)}%)`)
       } else if (latestViolation.type === 'multiple_faces') {
-        setFaceMonitoringResult('Multiple Faces Detected')
         setLiveResults(`Multiple Faces Detected (${latestViolation.score || 0} faces)`)
       }
     } else {
@@ -905,10 +898,10 @@ export default function App() {
     }
   }, [])
 
-  // Calculate summary report stats
-  const faceNotCenteredCount = violations.filter(v => v.type === 'face_not_visible').length
-  const faceTooSmallCount = 0 // Placeholder
-  const noFaceDetectedCount = violations.filter(v => v.type === 'face_not_visible').length
+  // Calculate summary report stats (if needed in the future)
+  // const faceNotCenteredCount = violations.filter(v => v.type === 'face_not_visible').length
+  // const faceTooSmallCount = 0 // Placeholder
+  // const noFaceDetectedCount = violations.filter(v => v.type === 'face_not_visible').length
 
   return (
     <div className="min-h-screen bg-slate-50 p-4">
