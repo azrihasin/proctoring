@@ -1,5 +1,5 @@
 import { useRef, useState, useEffect, useCallback } from 'react'
-import { FaceDetector, HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision'
+import { FaceDetector, ObjectDetector, FilesetResolver } from '@mediapipe/tasks-vision'
 import Webcam from 'react-webcam'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -34,7 +34,7 @@ export default function App() {
   const detectionCountRef = useRef<{ type: DetectionType; count: number }>({ type: null, count: 0 })
   const faceNotVisibleCountRef = useRef<number>(0) // Track consecutive frames without face detection
   const faceDetectorRef = useRef<FaceDetector | null>(null)
-  const handLandmarkerRef = useRef<HandLandmarker | null>(null)
+  const objectDetectorRef = useRef<ObjectDetector | null>(null)
   const detectionIntervalRef = useRef<number | null>(null) // Store interval ID for detection
   
   const cellPhoneDetectionDebounceRef = useRef<number | null>(null) // For debounce
@@ -287,42 +287,41 @@ export default function App() {
 
   const loadMediaPipeModels = async () => {
     try {
-      console.log('Loading MediaPipe models for face and hand detection...')
+      console.log('Loading MediaPipe models for face and object detection...')
       
       // Initialize MediaPipe vision tasks
       const vision = await FilesetResolver.forVisionTasks(
         'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
       )
       
-      // Load Face Detector
+      // Load Face Detector with improved parameters
       const faceDetector = await FaceDetector.createFromOptions(vision, {
         baseOptions: {
           modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',
           delegate: 'GPU'
         },
         runningMode: 'VIDEO',
-        minDetectionConfidence: 0.5,
-        minSuppressionThreshold: 0.3
+        minDetectionConfidence: 0.6, // Increased from 0.5 for better accuracy
+        minSuppressionThreshold: 0.5 // Increased from 0.3 to prevent duplicate detections on same person
       })
       
       faceDetectorRef.current = faceDetector
       console.log('✅ MediaPipe Face Detector loaded successfully')
       
-      // Load Hand Landmarker
-      const handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      // Load Object Detector for smartphone detection
+      const objectDetector = await ObjectDetector.createFromOptions(vision, {
         baseOptions: {
-          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
           delegate: 'GPU'
         },
         runningMode: 'VIDEO',
-        numHands: 2,
-        minHandDetectionConfidence: 0.5,
-        minHandPresenceConfidence: 0.5,
-        minTrackingConfidence: 0.5
+        scoreThreshold: 0.3, // Lowered from 0.5 for better phone detection
+        maxResults: 10 // Increased to see more detections
+        // Removed categoryAllowlist to detect all objects and filter manually
       })
       
-      handLandmarkerRef.current = handLandmarker
-      console.log('✅ MediaPipe Hand Landmarker loaded successfully')
+      objectDetectorRef.current = objectDetector
+      console.log('✅ MediaPipe Object Detector loaded successfully')
       
       setModelsLoaded(true)
 
@@ -345,7 +344,7 @@ export default function App() {
       video &&
       video.readyState === 4 &&
       faceDetectorRef.current &&
-      handLandmarkerRef.current
+      objectDetectorRef.current
     ) {
       const videoWidth = video.videoWidth
       const videoHeight = video.videoHeight
@@ -363,8 +362,8 @@ export default function App() {
           // Run MediaPipe Face Detection
           const faceResults = faceDetectorRef.current.detectForVideo(video, startTimeMs)
           
-          // Run MediaPipe Hand Detection
-          const handResults = handLandmarkerRef.current.detectForVideo(video, startTimeMs)
+          // Run MediaPipe Object Detection for smartphones
+          const objectResults = objectDetectorRef.current.detectForVideo(video, startTimeMs)
 
           const ctx = canvasRef.current.getContext('2d')
           if (ctx) {
@@ -408,31 +407,54 @@ export default function App() {
               }
             })
 
-            // Draw hand landmarks (for phone detection inference)
-            if (handResults.landmarks) {
-              handResults.landmarks.forEach((landmarks) => {
-                // Draw hand connections
-                ctx.strokeStyle = '#00ffff' // Cyan for hands
-                ctx.lineWidth = 2
+            // Draw object detections - ONLY cell phones
+            if (objectResults.detections && objectResults.detections.length > 0) {
+              objectResults.detections.forEach((detection) => {
+                if (!detection.categories || detection.categories.length === 0) return
                 
-                // Draw wrist point (landmark 0) prominently
-                const wrist = landmarks[0]
-                const wristX = wrist.x * videoWidth
-                const wristY = wrist.y * videoHeight
+                const category = detection.categories[0]
+                const categoryName = category.categoryName || ''
+                const categoryLower = categoryName.toLowerCase()
                 
-                ctx.fillStyle = '#00ffff'
-                ctx.beginPath()
-                ctx.arc(wristX, wristY, 5, 0, 2 * Math.PI)
-                ctx.fill()
+                // Check if this is a cell phone or phone-related object
+                const isCellPhone = categoryLower.includes('cell phone') || 
+                                   categoryLower.includes('phone') ||
+                                   categoryLower.includes('mobile') ||
+                                   categoryLower === 'cell phone'
                 
-                // Draw palm center approximation (average of key points)
-                const palmX = ((landmarks[0].x + landmarks[5].x + landmarks[17].x) / 3) * videoWidth
-                const palmY = ((landmarks[0].y + landmarks[5].y + landmarks[17].y) / 3) * videoHeight
+                // ONLY draw and process cell phones - ignore all other objects
+                if (!isCellPhone) return
                 
-                ctx.fillStyle = '#ffff00'
-                ctx.beginPath()
-                ctx.arc(palmX, palmY, 8, 0, 2 * Math.PI)
-                ctx.fill()
+                const bbox = detection.boundingBox
+                if (bbox) {
+                  const x = bbox.originX
+                  const y = bbox.originY
+                  const width = bbox.width
+                  const height = bbox.height
+                  
+                  // Draw cell phone with magenta color
+                  const boxColor = '#ff00ff' // Magenta for phones
+                  
+                  // Draw bounding box
+                  ctx.strokeStyle = boxColor
+                  ctx.lineWidth = 4
+                  ctx.strokeRect(x, y, width, height)
+                  
+                  // Draw label background
+                  ctx.fillStyle = boxColor
+                  const labelWidth = Math.max(200, categoryName.length * 10)
+                  ctx.fillRect(x, y - 25, labelWidth, 25)
+                  
+                  // Draw label text
+                  ctx.fillStyle = '#ffffff'
+                  ctx.font = 'bold 16px Arial'
+                  const confidence = (category.score * 100).toFixed(1)
+                  ctx.fillText(
+                    `${categoryName} (${confidence}%)`,
+                    x + 5,
+                    y - 8
+                  )
+                }
               })
             }
 
@@ -458,64 +480,74 @@ export default function App() {
                 35
               )
             }
+            
+            // Display cell phone detection count at bottom
+            const cellPhoneCount = objectResults.detections ? 
+              objectResults.detections.filter(detection => {
+                if (!detection.categories || detection.categories.length === 0) return false
+                const categoryLower = detection.categories[0].categoryName.toLowerCase()
+                return categoryLower.includes('cell phone') || 
+                       categoryLower.includes('phone') ||
+                       categoryLower.includes('mobile') ||
+                       categoryLower === 'cell phone'
+              }).length : 0
+            
+            if (cellPhoneCount > 0) {
+              ctx.fillStyle = 'rgba(255, 0, 255, 0.7)'
+              ctx.fillRect(10, videoHeight - 50, 250, 40)
+              ctx.fillStyle = '#ffffff'
+              ctx.font = 'bold 14px Arial'
+              ctx.fillText(
+                `Cell phones detected: ${cellPhoneCount}`,
+                15,
+                videoHeight - 25
+              )
+            }
 
           // Detection thresholds for MediaPipe
-          const REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE = 5 // 5 frames (0.5 seconds)
-          const REQUIRED_CONSECUTIVE_DETECTIONS_MULTIPLE_FACES = 10 // 10 frames (1.0 second)
+          const REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE = 3 // 3 frames (0.3 seconds) - faster response with more accurate detection
+          const REQUIRED_CONSECUTIVE_DETECTIONS_MULTIPLE_FACES = 8 // 8 frames (0.8 seconds) - reduced from 10 with better NMS
           const REQUIRED_CONSECUTIVE_FACE_MISSES = 20 // 20 frames (2.0 seconds)
           const CELL_PHONE_DEBOUNCE_MS = 1000 // 1 second debounce
           
           let currentDetection: DetectionType = null
           
-          // Detect smartphone usage via hand positions
-          // When someone holds a phone, typically both hands are close together near face level
-          let isPhonePostureDetected = false
-          if (handResults.landmarks && handResults.landmarks.length >= 1) {
-            handResults.landmarks.forEach((landmarks) => {
-              // Get wrist position (landmark 0)
-              const wrist = landmarks[0]
-              const wristY = wrist.y * videoHeight
-              
-              // Check if hand is in the upper 60% of frame (likely near face for phone use)
-              const isNearFaceLevel = wristY < videoHeight * 0.6
-              
-              // If hand is near face level and in phone-holding posture
-              if (isNearFaceLevel) {
-                isPhonePostureDetected = true
+          // Detect smartphone using object detection
+          let isCellPhoneDetected = false
+          let cellPhoneScore = 0
+          
+          if (objectResults.detections && objectResults.detections.length > 0) {
+            // Only check for cell phones - filter out all other objects
+            objectResults.detections.forEach((detection) => {
+              if (detection.categories && detection.categories.length > 0) {
+                const category = detection.categories[0]
+                const categoryLower = category.categoryName.toLowerCase()
                 
-                if (Math.random() < 0.05) { // Log 5% of detections
-                  console.log(`📱 Phone-holding posture detected (hand at y=${wristY.toFixed(0)})`)
+                // Check for cell phone category (comprehensive list of possible names)
+                // COCO dataset uses "cell phone" as the category name
+                const isPhone = categoryLower === 'cell phone' ||
+                               categoryLower.includes('cell phone') || 
+                               categoryLower.includes('cellphone') ||
+                               categoryLower === 'phone' ||
+                               categoryLower === 'mobile' ||
+                               categoryLower === 'mobile phone' ||
+                               categoryLower === 'smartphone'
+                
+                if (isPhone) {
+                  isCellPhoneDetected = true
+                  cellPhoneScore = Math.max(cellPhoneScore, category.score)
+                  
+                  // Always log phone detections
+                  console.log(`📱 CELL PHONE DETECTED: "${category.categoryName}" (${(category.score * 100).toFixed(1)}%)`)
                 }
               }
             })
-            
-            // If both hands detected and close together, higher confidence of phone use
-            if (handResults.landmarks.length === 2) {
-              const hand1Wrist = handResults.landmarks[0][0]
-              const hand2Wrist = handResults.landmarks[1][0]
-              
-              const hand1X = hand1Wrist.x * videoWidth
-              const hand1Y = hand1Wrist.y * videoHeight
-              const hand2X = hand2Wrist.x * videoWidth
-              const hand2Y = hand2Wrist.y * videoHeight
-              
-              const distance = Math.sqrt(Math.pow(hand1X - hand2X, 2) + Math.pow(hand1Y - hand2Y, 2))
-              const maxDistance = videoWidth * 0.3 // Within 30% of frame width
-              
-              if (distance < maxDistance) {
-                isPhonePostureDetected = true
-                
-                if (Math.random() < 0.05) { // Log 5% of detections
-                  console.log(`📱 Both hands close together (distance=${distance.toFixed(0)}px) - strong phone indicator`)
-                }
-              }
-            }
           }
           
-          // Set cell phone detection if phone posture detected
-          if (isPhonePostureDetected && !currentDetection) {
+          // Set cell phone detection if phone detected
+          if (isCellPhoneDetected && !currentDetection) {
             currentDetection = 'cell_phone'
-            latestDetectionScoreRef.current = { type: 'cell_phone', score: 0.8 }
+            latestDetectionScoreRef.current = { type: 'cell_phone', score: cellPhoneScore }
             
             // Add to detection history
             setDetectionHistory(prev => {
@@ -524,12 +556,12 @@ export default function App() {
                 {
                   type: 'cell_phone' as DetectionType,
                   timestamp: new Date(),
-                  score: 0.8
+                  score: cellPhoneScore
                 }
               ]
               return updated.slice(-100)
             })
-          } else if (!isPhonePostureDetected && activeCellPhoneViolationRef.current !== null) {
+          } else if (!isCellPhoneDetected && activeCellPhoneViolationRef.current !== null) {
             // End cell phone violation if no longer detected
             setViolations(prev => {
               const activeIndex = activeCellPhoneViolationRef.current
@@ -539,7 +571,7 @@ export default function App() {
                   ...updated[activeIndex],
                   endTime: new Date()
                 }
-                console.log('✅ Cell phone violation ended (no phone posture detected)')
+                console.log('✅ Cell phone violation ended (no phone detected)')
                 return updated
               }
               return prev
@@ -854,9 +886,9 @@ export default function App() {
         faceDetectorRef.current.close()
         faceDetectorRef.current = null
       }
-      if (handLandmarkerRef.current) {
-        handLandmarkerRef.current.close()
-        handLandmarkerRef.current = null
+      if (objectDetectorRef.current) {
+        objectDetectorRef.current.close()
+        objectDetectorRef.current = null
       }
       
       // Stop exam recording if active
@@ -910,20 +942,10 @@ export default function App() {
           </Button>
         </div>
 
-        {/* Three Column Layout */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          {/* Left Panel - Face Monitoring */}
-          <Card className="bg-purple-50 border-purple-200">
-            <CardHeader>
-              <CardTitle className="text-lg font-bold text-gray-900">Face Monitoring</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-sm text-gray-700">{faceMonitoringResult}</p>
-            </CardContent>
-          </Card>
-
-          {/* Middle Panel - Video Feed */}
-          <Card className="bg-orange-50 border-orange-200">
+        {/* Video Feed and Log Section - Side by Side */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {/* Video Feed - Takes 2 columns */}
+          <Card className="bg-orange-50 border-orange-200 lg:col-span-2">
             <CardContent className="p-0">
               <div className="relative w-full aspect-video bg-black rounded-lg overflow-hidden">
                 {webcamError ? (
@@ -968,45 +990,21 @@ export default function App() {
             </CardContent>
           </Card>
 
-          {/* Right Panel - Summary Report */}
-          <Card className="bg-red-50 border-red-200">
-            <CardHeader>
-              <CardTitle className="text-lg font-bold text-gray-900">Summary Report</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              <div className="text-sm text-gray-700">
-                Face Not Centered: {faceNotCenteredCount > 0 ? faceNotCenteredCount : ''}
-              </div>
-              <div className="text-sm text-gray-700">
-                Face Appears Too Small: {faceTooSmallCount > 0 ? faceTooSmallCount : ''}
-              </div>
-              <div className="text-sm text-gray-700">
-                Under Development:
-              </div>
-              <div className="text-sm text-gray-700">
-                No Face Detected: {noFaceDetectedCount > 0 ? noFaceDetectedCount : ''}
-              </div>
-              <div className="text-sm text-gray-700">
-                User Not Active On Current Tab: {userNotActiveCount}
-              </div>
+          {/* Log Section - Takes 1 column */}
+          <Card className="border-green-200 flex flex-col">
+            <div className="bg-green-100 rounded-t-lg p-3 border-b border-green-200">
+              <h2 className="text-lg font-bold text-gray-900">Log Section</h2>
+            </div>
+            <CardContent className="p-4 flex-1 flex flex-col">
+              <Textarea
+                readOnly
+                value={logEntries.join('\n')}
+                className="h-full bg-white border-gray-300 font-mono text-xs"
+                placeholder="Log entries will appear here..."
+              />
             </CardContent>
           </Card>
         </div>
-
-        {/* Log Section */}
-        <Card className="border-green-200">
-          <div className="bg-green-100 rounded-t-lg p-3 border-b border-green-200">
-            <h2 className="text-lg font-bold text-gray-900">Log Section</h2>
-          </div>
-          <CardContent className="p-4">
-            <Textarea
-              readOnly
-              value={logEntries.join('\n')}
-              className="min-h-[200px] bg-white border-gray-300 font-mono text-xs"
-              placeholder="Log entries will appear here..."
-            />
-          </CardContent>
-        </Card>
 
         {/* Snapshot Section */}
         <Card className="border-purple-200">
