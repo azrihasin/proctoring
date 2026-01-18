@@ -514,7 +514,7 @@ export default function EKYC({ onComplete }: EKYCProps) {
             onClick={() => handleDocumentSelect('id_card')}
             className="w-full bg-blue-500 hover:bg-blue-600 text-white font-medium py-6 text-base rounded-lg transition-all duration-100 ease-in"
           >
-            Choose document type
+            Take Id card Screenshot
           </Button>
         </div>
 
@@ -531,7 +531,7 @@ export default function EKYC({ onComplete }: EKYCProps) {
           <div className="relative flex items-center z-[20]">
             <button
               onClick={handleBack}
-              className="absolute left-0 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in z-[20]"
+              className="absolute left-0 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in z-[30]"
             >
               <ArrowLeft className="w-5 h-5 text-gray-700" />
             </button>
@@ -579,7 +579,7 @@ export default function EKYC({ onComplete }: EKYCProps) {
     <div className="h-full flex flex-col px-6 py-8">
       <div className="space-y-6 flex-1 flex flex-col">
         <div className="flex items-center">
-          <button onClick={handleBack} className="mr-4 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in">
+          <button onClick={handleBack} className="mr-4 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in relative z-[30]">
             <ArrowLeft className="w-5 h-5 text-gray-700" />
           </button>
           <FlyingText>
@@ -614,7 +614,7 @@ export default function EKYC({ onComplete }: EKYCProps) {
     <div className="h-full flex flex-col px-6 py-8">
       <div className="space-y-6 flex-1 flex flex-col justify-center">
         <div className="flex items-center">
-          <button onClick={handleBack} className="mr-4 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in">
+          <button onClick={handleBack} className="mr-4 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in relative z-[30]">
             <ArrowLeft className="w-5 h-5 text-gray-900" />
           </button>
           <FlyingText>
@@ -684,7 +684,7 @@ export default function EKYC({ onComplete }: EKYCProps) {
           <div className="relative flex items-center z-[20]">
             <button
               onClick={handleBack}
-              className="absolute left-0 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in z-[20]"
+              className="absolute left-0 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in z-[30]"
             >
               <ArrowLeft className="w-5 h-5 text-gray-700" />
             </button>
@@ -734,7 +734,7 @@ export default function EKYC({ onComplete }: EKYCProps) {
     <div className="h-full flex flex-col px-6 py-8">
       <div className="space-y-6 flex-1 flex flex-col">
         <div className="flex items-center">
-          <button onClick={handleBack} className="mr-4 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in">
+          <button onClick={handleBack} className="mr-4 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in relative z-[30]">
             <ArrowLeft className="w-5 h-5 text-gray-700" />
           </button>
           <FlyingText>
@@ -769,7 +769,7 @@ export default function EKYC({ onComplete }: EKYCProps) {
     <div className="h-full flex flex-col px-6 py-8">
       <div className="space-y-6 flex-1 flex flex-col justify-center">
         <div className="flex items-center">
-          <button onClick={handleBack} className="mr-4 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in">
+          <button onClick={handleBack} className="mr-4 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in relative z-[30]">
             <ArrowLeft className="w-5 h-5 text-gray-900" />
           </button>
           <FlyingText>
@@ -820,7 +820,7 @@ export default function EKYC({ onComplete }: EKYCProps) {
           <div className="relative flex items-center z-[20]">
             <button
               onClick={handleBack}
-              className="absolute left-0 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in z-[20]"
+              className="absolute left-0 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in z-[30]"
             >
               <ArrowLeft className="w-5 h-5 text-gray-700" />
             </button>
@@ -868,7 +868,7 @@ export default function EKYC({ onComplete }: EKYCProps) {
     <div className="h-full flex flex-col px-6 py-8">
       <div className="space-y-6 flex-1 flex flex-col">
         <div className="flex items-center">
-          <button onClick={handleBack} className="mr-4 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in">
+          <button onClick={handleBack} className="mr-4 p-2 hover:bg-gray-100 rounded-lg transition-all duration-100 ease-in relative z-[30]">
             <ArrowLeft className="w-5 h-5 text-gray-700" />
           </button>
           <FlyingText>
