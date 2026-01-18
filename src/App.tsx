@@ -4,6 +4,7 @@ import Webcam from 'react-webcam'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Textarea } from '@/components/ui/textarea'
+import EKYC from '@/components/EKYC'
 
 type DetectionType = 'cell_phone' | 'multiple_faces' | 'face_not_visible' | null
 
@@ -57,6 +58,9 @@ export default function App() {
   const [logEntries, setLogEntries] = useState<string[]>([])
   const [liveResults, setLiveResults] = useState<string>('No detection yet.')
   const lastTabActivityRef = useRef<number>(Date.now())
+  
+  // eKYC state
+  const [eKYCCompleted, setEKYCCompleted] = useState(false)
 
   // Get video element from webcam ref
   const getVideoElement = () => {
@@ -902,6 +906,11 @@ export default function App() {
   // const faceNotCenteredCount = violations.filter(v => v.type === 'face_not_visible').length
   // const faceTooSmallCount = 0 // Placeholder
   // const noFaceDetectedCount = violations.filter(v => v.type === 'face_not_visible').length
+
+  // Show eKYC flow if not completed
+  if (!eKYCCompleted) {
+    return <EKYC onComplete={() => setEKYCCompleted(true)} />
+  }
 
   return (
     <div className="min-h-screen bg-slate-50 p-4">
