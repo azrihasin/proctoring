@@ -464,16 +464,16 @@ export default function WebcamRecorder() {
         {state === 'ready' && (
           <button
             onClick={captureRecording}
-            disabled={state === 'capturing' || state === 'processing'}
+            disabled={false}
             style={{
               padding: '12px 24px',
               fontSize: '16px',
               fontWeight: 'bold',
-              backgroundColor: state === 'capturing' || state === 'processing' ? '#ccc' : '#f44336',
+              backgroundColor: '#f44336',
               color: 'white',
               border: 'none',
               borderRadius: '6px',
-              cursor: state === 'capturing' || state === 'processing' ? 'not-allowed' : 'pointer',
+              cursor: 'pointer',
               transition: 'background-color 0.2s'
             }}
           >
@@ -506,11 +506,11 @@ export default function WebcamRecorder() {
             padding: '12px 24px',
             fontSize: '16px',
             fontWeight: 'bold',
-            backgroundColor: state === 'capturing' || state === 'processing' ? '#ccc' : '#666',
+            backgroundColor: (state === 'capturing' || state === 'processing') ? '#ccc' : '#666',
             color: 'white',
             border: 'none',
             borderRadius: '6px',
-            cursor: state === 'capturing' || state === 'processing' ? 'not-allowed' : 'pointer',
+            cursor: (state === 'capturing' || state === 'processing') ? 'not-allowed' : 'pointer',
             transition: 'background-color 0.2s'
           }}
         >

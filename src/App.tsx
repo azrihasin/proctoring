@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Textarea } from '@/components/ui/textarea'
 import { FFmpeg } from '@ffmpeg/ffmpeg'
-import { fetchFile, toBlobURL } from '@ffmpeg/util'
+import { toBlobURL } from '@ffmpeg/util'
 import { fixWebmMetadata } from '@/lib/utils'
 // import EKYC from '@/components/EKYC'
 
@@ -72,18 +72,18 @@ export default function App() {
   
   // Exam recording state
   const [isExamActive, setIsExamActive] = useState(false)
+  const isExamActiveRef = useRef(false) // Ref to avoid stale closures
   const [examStartTime, setExamStartTime] = useState<Date | null>(null)
   const [recordingDuration, setRecordingDuration] = useState<number>(0) // Duration in seconds
   const examVideoChunksRef = useRef<Blob[]>([])
   const examTimerIntervalRef = useRef<number | null>(null) // For timer updates
   const examSaveIntervalRef = useRef<number | null>(null) // For periodic saving
   const lastSavedSegmentTimeRef = useRef<number>(0) // Track when last segment was saved
-  const [violations, setViolations] = useState<ViolationEntry[]>([])
+  const [, setViolations] = useState<ViolationEntry[]>([])
   
   // Rolling buffer for violation recording (10 seconds before detection)
   const rollingBufferRef = useRef<Array<{ blob: Blob; timestamp: number }>>([])
   const rollingBufferRecorderRef = useRef<MediaRecorder | null>(null)
-  const BUFFER_DURATION_MS = 10000 // 10 seconds
   
   // Get best supported MIME type for MediaRecorder (defined before hooks)
   const getBestMimeType = (): string => {
@@ -106,10 +106,7 @@ export default function App() {
   // Use react-media-recorder for exam recording
   const {
     status: examRecordingStatus,
-    startRecording: startExamRecording,
     stopRecording: stopExamRecording,
-    mediaBlobUrl: examMediaBlobUrl,
-    clearBlobUrl: clearExamBlobUrl,
   } = useReactMediaRecorder({
     video: true,
     audio: false,
@@ -125,10 +122,7 @@ export default function App() {
   // Use react-media-recorder for violation recording
   const {
     status: violationRecordingStatus,
-    startRecording: startViolationRecordingHook,
     stopRecording: stopViolationRecordingHook,
-    mediaBlobUrl: violationMediaBlobUrl,
-    clearBlobUrl: clearViolationBlobUrl,
   } = useReactMediaRecorder({
     video: true,
     audio: false,
@@ -143,6 +137,12 @@ export default function App() {
   
   const violationTimeoutRef = useRef<number | null>(null)
   const violationDetectionTimeRef = useRef<Date | null>(null)
+  const violationEndTimeoutRef = useRef<number | null>(null) // Track 2 seconds after detection ends
+  const activeViolationTypeRef = useRef<DetectionType>(null) // Track which violation is being recorded
+  
+  // Direct MediaRecorder for violations (simpler approach)
+  const violationRecorderRef = useRef<MediaRecorder | null>(null)
+  const violationChunksRef = useRef<Blob[]>([])
   
   // UI state
   const [isOverlayEnabled, setIsOverlayEnabled] = useState(true)
@@ -152,17 +152,63 @@ export default function App() {
   // Recorded videos list
   const [recordedVideos, setRecordedVideos] = useState<RecordedVideo[]>([])
 
+  // Log when recorded videos changes
+  useEffect(() => {
+    console.log(`📹 Recorded videos state updated! Total count: ${recordedVideos.length}`)
+    if (recordedVideos.length > 0) {
+      const latest = recordedVideos[recordedVideos.length - 1]
+      console.log(`   Latest video: ${latest.filename} (${latest.type})`)
+    }
+  }, [recordedVideos])
+
   // eKYC state
   // const [eKYCCompleted, setEKYCCompleted] = useState(false)
 
   // FFmpeg instance for video conversion
   const ffmpegRef = useRef<FFmpeg | null>(null)
-  const [ffmpegLoaded, setFfmpegLoaded] = useState(false)
 
   // Get video element from webcam ref
-  const getVideoElement = () => {
+  const getVideoElement = useCallback(() => {
     return webcamRef.current?.video
-  }
+  }, [])
+
+  // Get media stream reliably - tries multiple sources
+  const getMediaStream = useCallback((): MediaStream | null => {
+    console.log('🔍 getMediaStream called')
+    
+    // First try mediaStreamRef
+    if (mediaStreamRef.current) {
+      console.log(`📹 mediaStreamRef exists: active=${mediaStreamRef.current.active}, id=${mediaStreamRef.current.id}`)
+      if (mediaStreamRef.current.active) {
+        console.log('✅ Using stream from mediaStreamRef')
+        return mediaStreamRef.current
+      } else {
+        console.warn('⚠️ mediaStreamRef stream is not active')
+      }
+    } else {
+      console.warn('⚠️ mediaStreamRef.current is null')
+    }
+    
+    // Then try video element
+    const videoElement = webcamRef.current?.video
+    console.log(`📹 Video element: ${videoElement ? 'exists' : 'null'}, srcObject: ${videoElement?.srcObject ? 'exists' : 'null'}`)
+    
+    if (videoElement && videoElement.srcObject) {
+      const stream = videoElement.srcObject as MediaStream
+      console.log(`📹 Stream from video: active=${stream?.active}, id=${stream?.id}`)
+      if (stream && stream.active) {
+        console.log('✅ Using stream from video element')
+        // Update mediaStreamRef for future use
+        mediaStreamRef.current = stream
+        return stream
+      } else {
+        console.warn('⚠️ Stream from video element is not active')
+      }
+    }
+    
+    console.error('❌ No active stream found from any source')
+    return null
+  }, [])
 
   // Initialize FFmpeg
   useEffect(() => {
@@ -177,7 +223,6 @@ export default function App() {
           wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
         })
 
-        setFfmpegLoaded(true)
         console.log('✅ FFmpeg loaded successfully')
       } catch (error) {
         console.error('Error loading FFmpeg:', error)
@@ -198,27 +243,6 @@ export default function App() {
     return { blob: fixedWebmBlob, mime: mimeType, ext: ext as 'mp4' | 'webm', converted: false }
   }, [getBestMimeType])
 
-  // Concatenate before+after WebM chunks (no conversion)
-  const concatWebmChunks = useCallback(async (
-    beforeChunks: Blob[],
-    afterChunks: Blob[]
-  ): Promise<SavedVideo> => {
-    const mimeType = getBestMimeType()
-    const beforeBlob = new Blob(beforeChunks, { type: mimeType })
-    const afterBlob = new Blob(afterChunks, { type: mimeType })
-
-    // Fix WebM metadata before concatenation
-    console.log('🔧 Fixing WebM metadata for concatenation...')
-    const fixedBeforeBlob = await fixWebmMetadata(beforeBlob)
-    const fixedAfterBlob = await fixWebmMetadata(afterBlob)
-    
-    // Simply concatenate the blobs
-    const concatenatedBlob = new Blob([fixedBeforeBlob, fixedAfterBlob], { type: mimeType })
-    const ext = mimeType.includes('webm') ? 'webm' : 'mp4'
-    
-    console.log(`✅ Video chunks concatenated in original format: ${ext}`)
-    return { blob: concatenatedBlob, mime: mimeType, ext: ext as 'mp4' | 'webm', converted: false }
-  }, [getBestMimeType])
 
   // Handle webcam user media callback
   const handleUserMedia = useCallback((stream: MediaStream) => {
@@ -244,38 +268,6 @@ export default function App() {
   }, [])
 
 
-  // Start rolling buffer recorder (maintains last 10 seconds)
-  const startRollingBuffer = useCallback((stream: MediaStream) => {
-    try {
-      const mimeType = getBestMimeType()
-      const options = { mimeType, videoBitsPerSecond: 1500000 }
-      const recorder = new MediaRecorder(stream, options)
-      rollingBufferRecorderRef.current = recorder
-      rollingBufferRef.current = []
-
-      recorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          const now = Date.now()
-          rollingBufferRef.current.push({ blob: event.data, timestamp: now })
-          
-          // Remove chunks older than BUFFER_DURATION_MS
-          const cutoffTime = now - BUFFER_DURATION_MS
-          rollingBufferRef.current = rollingBufferRef.current.filter(
-            item => item.timestamp >= cutoffTime
-          )
-        }
-      }
-
-      recorder.onerror = (event) => {
-        console.error('Rolling buffer recorder error:', event)
-      }
-
-      recorder.start(1000) // 1 second time slicing
-      console.log(`✅ Rolling buffer recorder started (mimeType: ${recorder.mimeType})`)
-    } catch (error) {
-      console.error('Error starting rolling buffer recorder:', error)
-    }
-  }, [getBestMimeType])
 
   // Add log entry helper
   const addLogEntry = useCallback((message: string) => {
@@ -294,6 +286,9 @@ export default function App() {
 
   // Add recorded video to list
   const addRecordedVideo = useCallback((savedVideo: SavedVideo, filename: string, type: 'exam' | 'violation') => {
+    console.log(`📥 addRecordedVideo called: ${filename}, type: ${type}`)
+    console.log(`📊 Video size: ${savedVideo.blob.size} bytes, ext: ${savedVideo.ext}`)
+    
     // Store the blob directly - React state will keep it in memory
     // The blob should remain valid as long as it's in state
     const recordedVideo: RecordedVideo = {
@@ -308,85 +303,49 @@ export default function App() {
       size: savedVideo.blob.size,
       mp4Blob: savedVideo.converted && savedVideo.ext === 'mp4' ? savedVideo.blob : undefined,
     }
-    setRecordedVideos(prev => [...prev, recordedVideo])
+    
+    console.log(`🔄 Updating recordedVideos state...`)
+    setRecordedVideos(prev => {
+      const newList = [...prev, recordedVideo]
+      console.log(`✅ State updated! Total videos now: ${newList.length}`)
+      return newList
+    })
+    
     console.log(`✅ Video added to list: ${filename} (${(savedVideo.blob.size / (1024 * 1024)).toFixed(2)} MB, type: ${savedVideo.mime}, converted: ${savedVideo.converted})`)
   }, [])
 
-  // Process final exam video when blob becomes available from react-media-recorder
-  useEffect(() => {
-    if (examMediaBlobUrl && !isExamActive && examStartTime) {
-      const processFinalExamVideo = async () => {
-        try {
-          console.log('📹 Processing final exam video from react-media-recorder...')
-          // Fetch the blob from the URL
-          const response = await fetch(examMediaBlobUrl!)
-          const blob = await response.blob()
-          
-          if (blob.size === 0) {
-            console.warn('⚠️ Final exam video blob is empty')
-            return
-          }
-
-          console.log(`📦 Final exam video blob size: ${blob.size} bytes, type: ${blob.type}`)
-          
-          // Save video in original format
-          addLogEntry('Saving final exam video in original format...')
-          const result = await saveVideo(blob)
-          
-          if (result.blob.size < 50_000) {
-            console.warn('⚠️ Final video too small, may be corrupted')
-            addLogEntry('Final video too small, skipping save')
-            return
-          }
-
-          // Generate timestamped filename
-          const now = new Date()
-          const year = now.getFullYear()
-          const month = String(now.getMonth() + 1).padStart(2, '0')
-          const day = String(now.getDate()).padStart(2, '0')
-          const hours = String(now.getHours()).padStart(2, '0')
-          const minutes = String(now.getMinutes()).padStart(2, '0')
-          const seconds = String(now.getSeconds()).padStart(2, '0')
-          
-          const timestamp = `${year}${month}${day}_${hours}${minutes}${seconds}`
-          const duration = Math.floor(recordingDuration / 60)
-          const durationSec = recordingDuration % 60
-          const filename = `exam_recording_complete_${timestamp}_${duration}m${durationSec}s.${result.ext}`
-          
-          // Add to recorded videos list
-          addRecordedVideo(result, filename, 'exam')
-          addLogEntry(`Final exam video saved: ${filename} - Added to download list`)
-
-          console.log(`✅ Final exam video processed: ${filename}`)
-          
-          // Clear the blob URL
-          clearExamBlobUrl()
-        } catch (error) {
-          console.error('❌ Error processing final exam video:', error)
-          addLogEntry(`Error processing final exam video: ${error instanceof Error ? error.message : 'Unknown error'}`)
-        }
-      }
-      
-      processFinalExamVideo()
-    }
-  }, [examMediaBlobUrl, isExamActive, examStartTime, recordingDuration, saveVideo, addRecordedVideo, addLogEntry, clearExamBlobUrl])
+  // Don't process final exam video - we're not recording the exam anymore
+  // This effect is disabled since we only record violations
 
   // Process violation video when blob becomes available (moved after function definitions)
+  // NOTE: This is now handled directly in processViolationVideoDirectly() called from recorder.onstop
+  // Keeping this commented out for reference
+  /*
   useEffect(() => {
-    if (violationMediaBlobUrl && violationDetectionTimeRef.current) {
+    console.log('🔍 Process violation video effect triggered', {
+      violationMediaBlobUrl: !!violationMediaBlobUrl,
+      violationDetectionTimeRef: !!violationDetectionTimeRef.current,
+      activeViolationTypeRef: activeViolationTypeRef.current
+    })
+    
+    if (violationMediaBlobUrl && violationDetectionTimeRef.current && activeViolationTypeRef.current) {
       const processViolationVideo = async () => {
         try {
+          console.log('🎬 Starting violation video processing...')
           // Fetch the blob from the URL
           const response = await fetch(violationMediaBlobUrl!)
           const blob = await response.blob()
           
           console.log('🛑 Violation recorder stopped, processing video...')
+          console.log(`📦 Blob fetched: size=${blob.size}, type=${blob.type}`)
+          
           const bufferChunks = rollingBufferRef.current.map(item => item.blob)
 
           console.log(`📹 Buffer chunks: ${bufferChunks.length}, After blob size: ${blob.size}`)
 
           if (bufferChunks.length === 0 && blob.size === 0) {
             console.warn('⚠️ No video chunks available for violation recording')
+            addLogEntry('⚠️ No video chunks for violation')
             return
           }
 
@@ -405,29 +364,38 @@ export default function App() {
           }
 
           const timestamp = violationDetectionTimeRef.current!.toISOString().replace(/[:.]/g, '-').slice(0, -5)
-          const filename = `cell_phone_detection_${timestamp}.${result.ext}`
+          const violationType = activeViolationTypeRef.current || 'unknown'
+          const violationTypeStr = violationType === 'cell_phone' ? 'cell_phone_detection' :
+                                   violationType === 'multiple_faces' ? 'multiple_faces_detection' :
+                                   violationType === 'face_not_visible' ? 'face_not_visible_detection' :
+                                   'violation'
+          const filename = `${violationTypeStr}_${timestamp}.${result.ext}`
 
-          console.log(`💾 Adding video to list: ${filename}`)
+          console.log(`💾 Adding violation video to list: ${filename}`)
+          console.log(`📊 Video details: type=${violationType}, size=${result.blob.size}, ext=${result.ext}`)
           
-          // Add to recorded videos list
+          // Add to recorded videos list immediately
           addRecordedVideo(result, filename, 'violation')
-          addLogEntry(`Cell phone violation video saved: ${filename} - Added to download list`)
+          addLogEntry(`✅ Violation video recorded and added to list: ${filename}`)
 
-          console.log(`✅ Violation video added to list successfully: ${filename}`)
+          console.log(`✅ Violation video added to download list: ${filename}`)
           
-          // Clear the detection time ref and blob URL
+          // Clear the detection time ref, violation type, and blob URL after processing
           violationDetectionTimeRef.current = null
+          activeViolationTypeRef.current = null
           clearViolationBlobUrl()
         } catch (error) {
           console.error('❌ Error processing violation video:', error)
           addLogEntry(`Error processing violation video: ${error instanceof Error ? error.message : 'Unknown error'}`)
           violationDetectionTimeRef.current = null
+          activeViolationTypeRef.current = null
         }
       }
       
       processViolationVideo()
     }
   }, [violationMediaBlobUrl, concatWebmChunks, addRecordedVideo, addLogEntry, getBestMimeType, clearViolationBlobUrl])
+  */
 
   // MediaRecorder for chunk access (needed for periodic saving)
   const examChunkRecorderRef = useRef<MediaRecorder | null>(null)
@@ -447,7 +415,18 @@ export default function App() {
     }
 
     try {
+      // Ensure mediaStreamRef is set to the current stream
+      mediaStreamRef.current = stream
+      console.log(`✅ Stream stored in mediaStreamRef: ${stream.id}, active=${stream.active}, videoTracks=${stream.getVideoTracks().length}`)
+      
+      // Verify stream is active
+      if (!stream.active) {
+        console.warn('⚠️ Stream is not active!')
+        addLogEntry('Warning: Stream is not active')
+      }
+      
       setIsExamActive(true)
+      isExamActiveRef.current = true // Update ref immediately
       const startTime = new Date()
       setExamStartTime(startTime)
       setRecordingDuration(0)
@@ -458,111 +437,27 @@ export default function App() {
       examVideoChunksRef.current = []
       lastSavedSegmentTimeRef.current = Date.now()
 
-      // Start react-media-recorder recording
-      startExamRecording()
-      
-      // Also create a MediaRecorder for chunk access (for periodic saving)
-      const mimeType = getBestMimeType()
-      const options = { mimeType, videoBitsPerSecond: 1500000 }
-      const chunkRecorder = new MediaRecorder(stream, options)
-      examChunkRecorderRef.current = chunkRecorder
+      // ⚠️ IMPORTANT: NO RECORDING STARTS HERE - ONLY WHEN VIOLATIONS ARE DETECTED
+      // startExamRecording() // DISABLED - NO EXAM RECORDING
+      // startRollingBuffer(stream) // DISABLED - NO PRE-RECORDING BUFFER
+      // NO MediaRecorder is created here
+      // NO recording is started here
+      // Recording ONLY starts in startViolationRecording() when violations are detected
 
-      chunkRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          examVideoChunksRef.current.push(event.data)
-        }
-      }
-
-      chunkRecorder.onerror = (event) => {
-        console.error('Exam chunk recorder error:', event)
-      }
-
-      chunkRecorder.start(1000) // 1 second time slicing
-      console.log(`✅ Exam recording started (mimeType: ${chunkRecorder.mimeType})`)
-      
-      // Start rolling buffer for violation recording
-      startRollingBuffer(stream)
-
-      // Start timer interval (update every second)
+      // Start timer interval (update every second) - just for display
       examTimerIntervalRef.current = window.setInterval(() => {
         const elapsed = Math.floor((Date.now() - startTime.getTime()) / 1000)
         setRecordingDuration(elapsed)
       }, 1000)
 
-      // Save video segment every 30 seconds - use inline function to avoid dependency issues
-      examSaveIntervalRef.current = window.setInterval(async () => {
-        if (examVideoChunksRef.current.length > 0 && isExamActive && examChunkRecorderRef.current) {
-          try {
-            // Request any pending data from the recorder before creating the blob
-            if (examChunkRecorderRef.current.state === 'recording') {
-              examChunkRecorderRef.current.requestData()
-              // Wait a bit for the data to be available
-              await new Promise(resolve => setTimeout(resolve, 500))
-            }
-
-            // Only save if we have enough chunks (at least 2 seconds worth)
-            if (examVideoChunksRef.current.length < 2) {
-              console.log('⏭️ Skipping save - not enough chunks yet')
-              return
-            }
-
-            // Create a copy of chunks to save (don't clear yet)
-            const chunksToSave = [...examVideoChunksRef.current]
-            const recorderMimeType = examChunkRecorderRef.current?.mimeType || getBestMimeType()
-            const webmBlob = new Blob(chunksToSave, { type: recorderMimeType })
-            
-            // Only proceed if blob has reasonable size (at least 100KB)
-            if (webmBlob.size < 100_000) {
-              console.log(`⏭️ Skipping save - blob too small: ${webmBlob.size} bytes`)
-              return
-            }
-
-            console.log(`💾 Saving video segment: ${chunksToSave.length} chunks, ${webmBlob.size} bytes`)
-            try {
-              const result = await saveVideo(webmBlob)
-              
-              // Double-check the video has reasonable size
-              if (result.blob.size < 50_000) {
-                console.warn('⚠️ Video too small, skipping save')
-                return
-              }
-              
-              const now = new Date()
-              const year = now.getFullYear()
-              const month = String(now.getMonth() + 1).padStart(2, '0')
-              const day = String(now.getDate()).padStart(2, '0')
-              const hours = String(now.getHours()).padStart(2, '0')
-              const minutes = String(now.getMinutes()).padStart(2, '0')
-              const seconds = String(now.getSeconds()).padStart(2, '0')
-              
-              const timestamp = `${year}${month}${day}_${hours}${minutes}${seconds}`
-              const currentDuration = Math.floor((Date.now() - startTime.getTime()) / 1000)
-              const duration = Math.floor(currentDuration / 60)
-              const durationSec = currentDuration % 60
-              const filename = `exam_recording_${timestamp}_${duration}m${durationSec}s.${result.ext}`
-              
-              addRecordedVideo(result, filename, 'exam')
-              addLogEntry(`Exam video segment saved: ${filename} (${duration}m ${durationSec}s)`)
-              
-              // Clear chunks after successful save
-              examVideoChunksRef.current = []
-              lastSavedSegmentTimeRef.current = Date.now()
-              console.log(`✅ Video segment saved successfully: ${filename}`)
-            } catch (error) {
-              console.error('Error saving exam video segment:', error)
-              addLogEntry(`Error saving video segment: ${error instanceof Error ? error.message : 'Unknown error'}`)
-            }
-          } catch (error) {
-            console.error('Error in exam save interval:', error)
-            addLogEntry(`Error in exam save interval: ${error instanceof Error ? error.message : 'Unknown error'}`)
-          }
-        }
-      }, 30000) // 30 seconds
+      // NO exam video segments - NO periodic recording
+      addLogEntry('✅ Exam started - NO recording active. Recording will ONLY start when violations are detected.')
+      console.log('✅ Exam started - NO RECORDING STARTED. Only timer started. Recording will begin ONLY when violations are detected.')
     } catch (error) {
       console.error('Error starting exam recording:', error)
       setIsExamActive(false)
     }
-  }, [startRollingBuffer, saveVideo, addRecordedVideo, addLogEntry, isExamActive, startExamRecording, getBestMimeType])
+  }, [addLogEntry])
 
   // Validate blob duration and metadata
   const validateBlobDuration = useCallback((blob: Blob): Promise<{ duration: number; isValid: boolean }> => {
@@ -681,9 +576,18 @@ export default function App() {
         rollingBufferRecorderRef.current = null
       }
       
-      // Stop violation recorder if active (using react-media-recorder)
+      // Stop direct violation recorder if active
+      if (violationRecorderRef.current && violationRecorderRef.current.state === 'recording') {
+        violationRecorderRef.current.stop()
+        // Wait a bit for the violation video to be processed
+        await new Promise(resolve => setTimeout(resolve, 1000))
+      }
+      
+      // Stop violation recorder if active (using react-media-recorder) - keeping for compatibility
       if (violationRecordingStatus === 'recording') {
         stopViolationRecordingHook()
+        // Wait a bit for the violation video to be processed
+        await new Promise(resolve => setTimeout(resolve, 1000))
       }
       
       if (violationTimeoutRef.current) {
@@ -691,72 +595,22 @@ export default function App() {
         violationTimeoutRef.current = null
       }
       
-      // Stop react-media-recorder exam recording
-      stopExamRecording()
-      
-      // Stop chunk recorder and wait for final data
-      const chunkRecorder = examChunkRecorderRef.current
-      if (chunkRecorder && chunkRecorder.state !== 'inactive') {
-        await new Promise<void>((resolve) => {
-          chunkRecorder.onstop = async () => {
-            await new Promise(resolve => setTimeout(resolve, 500))
-            resolve()
-          }
-          
-          if (chunkRecorder.state === 'recording') {
-            chunkRecorder.requestData()
-          }
-          chunkRecorder.stop()
-        })
+      if (violationEndTimeoutRef.current) {
+        clearTimeout(violationEndTimeoutRef.current)
+        violationEndTimeoutRef.current = null
       }
       
-      // Save final segment if there are remaining chunks
-      if (examVideoChunksRef.current.length > 0) {
-        const recorderMimeType = chunkRecorder?.mimeType || getBestMimeType()
-        const webmBlob = new Blob(examVideoChunksRef.current, { type: recorderMimeType })
-          
-          // Only save if blob has reasonable size
-          if (webmBlob.size < 100_000) {
-            console.warn(`⚠️ Final video blob too small: ${webmBlob.size} bytes, skipping save`)
-            addLogEntry(`Final video segment too small (${webmBlob.size} bytes), skipping save`)
-          } else {
-            // Save final video in original format
-            addLogEntry('Saving final video segment in original format...')
-            try {
-              const result = await saveVideo(webmBlob)
-              
-              // Double-check the video has reasonable size
-              if (result.blob.size < 50_000) {
-                console.warn('⚠️ Final video too small, skipping save')
-                addLogEntry('Final video too small, skipping save')
-                return
-              }
-              
-              // Generate timestamped filename
-              const now = new Date()
-              const year = now.getFullYear()
-              const month = String(now.getMonth() + 1).padStart(2, '0')
-              const day = String(now.getDate()).padStart(2, '0')
-              const hours = String(now.getHours()).padStart(2, '0')
-              const minutes = String(now.getMinutes()).padStart(2, '0')
-              const seconds = String(now.getSeconds()).padStart(2, '0')
-              
-              const timestamp = `${year}${month}${day}_${hours}${minutes}${seconds}`
-              const duration = Math.floor(recordingDuration / 60)
-              const durationSec = recordingDuration % 60
-              const filename = `exam_recording_final_${timestamp}_${duration}m${durationSec}s.${result.ext}`
-              
-              // Add to recorded videos list
-              addRecordedVideo(result, filename, 'exam')
-              addLogEntry(`Final exam video saved: ${filename} - Added to download list`)
-            } catch (error) {
-              console.error('Error saving final video:', error)
-              addLogEntry(`Error saving final video: ${error instanceof Error ? error.message : 'Unknown error'}`)
-            }
-          }
-        }
+      // Clear active violation type (after waiting for any pending processing)
+      activeViolationTypeRef.current = null
+      
+      // Don't stop exam recording - we're not recording the exam anymore
+      // stopExamRecording() // Disabled - only recording violations
+      
+      // No final exam video to save - only violation recordings are saved
+      addLogEntry('Exam ended - only violation recordings were saved')
 
         setIsExamActive(false)
+        isExamActiveRef.current = false // Update ref
         setExamStartTime(null)
         setRecordingDuration(0)
         examVideoChunksRef.current = []
@@ -769,39 +623,204 @@ export default function App() {
     }
   }, [isExamActive, recordingDuration, saveVideo, addLogEntry, addRecordedVideo, getBestMimeType, stopExamRecording, stopViolationRecordingHook, violationRecordingStatus])
 
-  // Start violation recording (10 seconds after detection)
-  const startViolationRecording = useCallback(async (_stream: MediaStream, detectionTime: Date) => {
-    // Stop any existing violation recording
-    if (violationRecordingStatus === 'recording') {
-      stopViolationRecordingHook()
-      // Wait a bit for it to stop
+  // Start violation recording (automatically when violation detected) - DIRECT APPROACH
+  const startViolationRecording = useCallback(async (stream: MediaStream, detectionTime: Date, violationType: DetectionType) => {
+    console.log(`🎥🎥🎥 DIRECT startViolationRecording CALLED for ${violationType}`)
+    console.log(`📊 Stream info: active=${stream.active}, id=${stream.id}, videoTracks=${stream.getVideoTracks().length}`)
+    addLogEntry(`🎥 Attempting to start recording for ${violationType} violation`)
+    
+    // Validate stream
+    if (!stream || !stream.active) {
+      console.error('❌ Stream is not active or invalid')
+      addLogEntry('Error: Video stream is not active')
+      return
+    }
+    
+    const videoTracks = stream.getVideoTracks()
+    if (videoTracks.length === 0) {
+      console.error('❌ No video tracks in stream')
+      addLogEntry('Error: No video tracks available')
+      return
+    }
+    
+    // Check if video track is enabled
+    const videoTrack = videoTracks[0]
+    if (videoTrack.readyState !== 'live') {
+      console.error(`❌ Video track not live: ${videoTrack.readyState}`)
+      addLogEntry(`Error: Video track state is ${videoTrack.readyState}`)
+      return
+    }
+    
+    // Stop any existing violation recording first
+    if (violationRecorderRef.current && violationRecorderRef.current.state === 'recording') {
+      console.log('⏹️ Stopping existing violation recording...')
+      violationRecorderRef.current.stop()
       await new Promise(resolve => setTimeout(resolve, 500))
     }
 
     try {
-      // Store detection time for processing later
+      // Store detection time and type for processing later
       violationDetectionTimeRef.current = detectionTime
+      activeViolationTypeRef.current = violationType
+      violationChunksRef.current = []
       
-      // Start react-media-recorder violation recording
-      startViolationRecordingHook()
-      console.log(`✅ Violation recording started (will record for 10 seconds)`)
-      addLogEntry('Violation recording started (10 seconds)')
+      console.log(`📝 Set violation refs: time=${detectionTime.toISOString()}, type=${violationType}`)
       
-      // Stop recording after 10 seconds
-      violationTimeoutRef.current = window.setTimeout(() => {
-        console.log('⏰ Violation recording timeout reached, stopping recorder...')
-        if (violationRecordingStatus === 'recording') {
-          stopViolationRecordingHook()
-          console.log('🛑 Violation recorder stopped')
+      // Clear any existing end timeout
+      if (violationEndTimeoutRef.current) {
+        console.log('🔄 Clearing existing end timeout')
+        clearTimeout(violationEndTimeoutRef.current)
+        violationEndTimeoutRef.current = null
+      }
+      
+      // Create MediaRecorder directly
+      const mimeType = getBestMimeType()
+      console.log(`📹 Using MIME type: ${mimeType}`)
+      const options = { mimeType, videoBitsPerSecond: 1500000 }
+      
+      // Check if MediaRecorder is supported
+      if (!MediaRecorder.isTypeSupported(mimeType)) {
+        console.warn(`⚠️ MIME type ${mimeType} not supported, using default`)
+      }
+      
+      const recorder = new MediaRecorder(stream, options)
+      violationRecorderRef.current = recorder
+      
+      console.log(`📹 MediaRecorder created: state=${recorder.state}, mimeType=${recorder.mimeType}`)
+      
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          console.log(`📦 Violation chunk received: ${event.data.size} bytes, total chunks: ${violationChunksRef.current.length + 1}`)
+          violationChunksRef.current.push(event.data)
+          addLogEntry(`📦 Video chunk ${violationChunksRef.current.length}: ${event.data.size} bytes`)
         } else {
-          console.warn('⚠️ Violation recorder is already inactive')
+          console.warn(`⚠️ Empty chunk received`)
         }
-      }, 10000)
+      }
+      
+      recorder.onstop = async () => {
+        console.log('🛑 🛑 🛑 Violation recorder ONSTOP fired!')
+        console.log(`📊 Chunks count: ${violationChunksRef.current.length}`)
+        console.log(`📝 Detection time: ${violationDetectionTimeRef.current}`)
+        console.log(`📝 Violation type: ${activeViolationTypeRef.current}`)
+        addLogEntry(`🛑 Recorder stopped - processing ${violationChunksRef.current.length} chunks`)
+        
+        // Wait a moment to ensure all data is available
+        await new Promise(resolve => setTimeout(resolve, 100))
+        
+        // Process video directly here to avoid closure issues
+        if (violationChunksRef.current.length === 0) {
+          console.error('❌❌❌ NO CHUNKS TO PROCESS - RECORDING FAILED')
+          addLogEntry('❌ ERROR: No video chunks for violation - recording may have failed')
+          return
+        }
+        
+        if (!violationDetectionTimeRef.current || !activeViolationTypeRef.current) {
+          console.error('❌ Missing detection info')
+          addLogEntry('❌ ERROR: Missing detection info')
+          return
+        }
+        
+        try {
+          const currentMimeType = getBestMimeType()
+          const totalSize = violationChunksRef.current.reduce((sum, chunk) => sum + chunk.size, 0)
+          console.log(`📦 Creating blob from ${violationChunksRef.current.length} chunks, total size: ${totalSize} bytes`)
+          
+          const blob = new Blob(violationChunksRef.current, { type: currentMimeType })
+          console.log(`📦 Created blob: ${blob.size} bytes, type: ${blob.type}`)
+          
+          if (blob.size < 50_000) {
+            console.error(`❌ Video too small: ${blob.size} bytes (expected at least 50KB)`)
+            addLogEntry(`❌ ERROR: Violation video too small (${blob.size} bytes), skipping save`)
+            return
+          }
+          
+          // Fix metadata
+          console.log('🔧 Fixing WebM metadata...')
+          addLogEntry('🔧 Fixing video metadata...')
+          const fixedBlob = await fixWebmMetadata(blob)
+          console.log(`✅ Metadata fixed: ${fixedBlob.size} bytes`)
+          
+          const ext = currentMimeType.includes('webm') ? 'webm' : 'mp4'
+          const result: SavedVideo = { 
+            blob: fixedBlob, 
+            mime: currentMimeType, 
+            ext: ext as 'mp4' | 'webm', 
+            converted: false 
+          }
+          
+          const timestamp = violationDetectionTimeRef.current!.toISOString().replace(/[:.]/g, '-').slice(0, -5)
+          const violationType = activeViolationTypeRef.current!
+          const violationTypeStr = violationType === 'cell_phone' ? 'cell_phone_detection' :
+                                   violationType === 'multiple_faces' ? 'multiple_faces_detection' :
+                                   violationType === 'face_not_visible' ? 'face_not_visible_detection' :
+                                   'violation'
+          const filename = `${violationTypeStr}_${timestamp}.${result.ext}`
+
+          console.log(`💾💾💾 ADDING VIDEO TO LIST NOW: ${filename} (${(fixedBlob.size / (1024 * 1024)).toFixed(2)} MB)`)
+          addLogEntry(`💾 Saving violation video: ${filename} (${(fixedBlob.size / (1024 * 1024)).toFixed(2)} MB)`)
+          
+          // Add to recorded videos list immediately
+          addRecordedVideo(result, filename, 'violation')
+          addLogEntry(`✅✅✅ VIOLATION VIDEO SAVED: ${filename}`)
+
+          console.log(`✅✅✅ VIDEO ADDED TO LIST: ${filename}`)
+          console.log(`🔔 Check the UI - video should be visible now!`)
+          
+          // Clear refs
+          violationDetectionTimeRef.current = null
+          activeViolationTypeRef.current = null
+          violationChunksRef.current = []
+        } catch (error) {
+          console.error('❌❌❌ ERROR in onstop processing:', error)
+          addLogEntry(`❌ ERROR processing violation video: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        }
+      }
+      
+      recorder.onerror = (event) => {
+        console.error('❌ Violation recorder error:', event)
+        addLogEntry(`Violation recorder error occurred`)
+      }
+      
+      // ⚠️ THIS IS THE ONLY PLACE WHERE RECORDING STARTS - ONLY WHEN VIOLATION DETECTED
+      // Start recording
+      try {
+        recorder.start(1000) // 1 second chunks
+        console.log(`🎬🎬🎬 RECORDING STARTED - Violation: ${violationType}, state=${recorder.state}`)
+        console.log(`⚠️ THIS IS THE ONLY PLACE RECORDING STARTS - ONLY ON VIOLATION DETECTION`)
+        addLogEntry(`🎬 RECORDING STARTED: ${violationType} violation detected (will record 10 seconds)`)
+      } catch (startError) {
+        console.error('❌ Error starting recorder:', startError)
+        addLogEntry(`Error starting recorder: ${startError instanceof Error ? startError.message : 'Unknown error'}`)
+        throw startError
+      }
+      
+      // Schedule stop after exactly 10 seconds from detection time
+      violationEndTimeoutRef.current = window.setTimeout(async () => {
+        console.log('⏰ 10 seconds after violation detected, stopping recorder NOW...')
+        
+        if (violationRecorderRef.current && violationRecorderRef.current.state === 'recording') {
+          console.log('⏹️ Stopping violation recorder...')
+          // Request any pending data before stopping
+          violationRecorderRef.current.requestData()
+          // Wait a bit for data to be available
+          await new Promise(resolve => setTimeout(resolve, 200))
+          violationRecorderRef.current.stop()
+          console.log('🛑 Recorder stop called - onstop will process video')
+        } else {
+          console.warn(`⚠️ Recorder state: ${violationRecorderRef.current?.state || 'null'}`)
+          addLogEntry(`⚠️ Recorder not in recording state: ${violationRecorderRef.current?.state || 'null'}`)
+        }
+        violationEndTimeoutRef.current = null
+      }, 10000) // 10 seconds after detection
+      
+      console.log('✅ Violation stop scheduled for 10 seconds from now')
     } catch (error) {
-      console.error('Error starting violation recording:', error)
+      console.error('❌ Error starting violation recording:', error)
       addLogEntry(`Error starting violation recording: ${error instanceof Error ? error.message : 'Unknown error'}`)
     }
-  }, [startViolationRecordingHook, stopViolationRecordingHook, violationRecordingStatus, addLogEntry])
+  }, [addLogEntry, getBestMimeType, addRecordedVideo])
+
 
   // Add violation to list when detected
   const addViolation = useCallback((type: DetectionType, score?: number) => {
@@ -1177,6 +1196,10 @@ export default function App() {
                   endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
                 }
                 console.log('✅ Cell phone violation ended (no phone detected)')
+                
+                // Violation recording stops automatically after 10 seconds from detection
+                // No need to schedule stop here
+                
                 return updated
               }
               return prev
@@ -1201,6 +1224,10 @@ export default function App() {
                   endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
                 }
                 console.log('✅ Multiple faces violation ended')
+                
+                // Violation recording stops automatically after 10 seconds from detection
+                // No need to schedule stop here
+                
                 return updated
               }
               return prev
@@ -1244,6 +1271,10 @@ export default function App() {
                       endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
                     }
                     console.log('✅ Face not visible violation ended (face detected)')
+                    
+                    // Violation recording stops automatically after 10 seconds from detection
+                    // No need to schedule stop here
+                    
                     return updated
                   }
                   return prev
@@ -1321,29 +1352,91 @@ export default function App() {
           }
           
           if (shouldTriggerAlert) {
+            console.log(`🚨🚨🚨 VIOLATION ALERT TRIGGERED: ${confirmedDetection}`)
+            console.log(`📊 Current state - isExamActive (state): ${isExamActive}, isExamActive (ref): ${isExamActiveRef.current}`)
             // Log violation
             if (confirmedDetection === 'cell_phone') {
               if (activeCellPhoneViolationRef.current === null) {
                 console.log('⚠️ VIOLATION TRIGGERED: Cell Phone Detected!')
+                console.log(`📊 Exam active: ${isExamActive}, Media stream: ${!!mediaStreamRef.current}`)
                 
-                // Start violation recording (10s before + 10s after)
-                if (isExamActive && mediaStreamRef.current) {
+                // Start violation recording automatically
+                const streamToUse = getMediaStream()
+                const examIsActive = isExamActiveRef.current || isExamActive // Check both ref and state
+                
+                console.log(`🔍 Recording check - examActive (ref): ${isExamActiveRef.current}, examActive (state): ${isExamActive}, stream: ${!!streamToUse}`)
+                
+                if (examIsActive && streamToUse) {
+                  console.log('🎬 Starting cell phone violation recording...')
                   const detectionTime = new Date()
                   // Fire and forget - violation recording runs in background
-                  startViolationRecording(mediaStreamRef.current, detectionTime).catch((error) => {
+                  startViolationRecording(streamToUse, detectionTime, 'cell_phone').catch((error) => {
                     console.error('Error starting violation recording:', error)
                     addLogEntry(`Error starting violation recording: ${error instanceof Error ? error.message : 'Unknown error'}`)
                   })
+                } else {
+                  console.error(`❌ CANNOT START RECORDING - exam active (ref): ${isExamActiveRef.current}, exam active (state): ${isExamActive}, stream: ${!!streamToUse}`)
+                  addLogEntry(`❌ CANNOT START RECORDING - exam active: ${examIsActive}, stream available: ${!!streamToUse}`)
                 }
+              } else {
+                // Violation is ongoing - each violation gets its own 10-second recording
+                // Don't cancel timeout - let current recording finish
+                console.log('🔄 Cell phone violation ongoing - current recording will finish in 10 seconds')
               }
               lastCellPhoneDetectionTimeRef.current = Date.now()
             } else if (confirmedDetection === 'multiple_faces') {
               if (activeMultipleFacesViolationRef.current === null) {
                 console.log('⚠️ VIOLATION TRIGGERED: Multiple Faces Detected!')
+                console.log(`📊 Exam active: ${isExamActive}, Media stream: ${!!mediaStreamRef.current}`)
+                
+                // Start violation recording automatically
+                const streamToUse = getMediaStream()
+                const examIsActive = isExamActiveRef.current || isExamActive // Check both ref and state
+                
+                console.log(`🔍 Recording check - examActive (ref): ${isExamActiveRef.current}, examActive (state): ${isExamActive}, stream: ${!!streamToUse}`)
+                
+                if (examIsActive && streamToUse) {
+                  console.log('🎬 Starting multiple faces violation recording...')
+                  const detectionTime = new Date()
+                  startViolationRecording(streamToUse, detectionTime, 'multiple_faces').catch((error) => {
+                    console.error('Error starting violation recording:', error)
+                    addLogEntry(`Error starting violation recording: ${error instanceof Error ? error.message : 'Unknown error'}`)
+                  })
+                } else {
+                  console.error(`❌ CANNOT START RECORDING - exam active (ref): ${isExamActiveRef.current}, exam active (state): ${isExamActive}, stream: ${!!streamToUse}`)
+                  addLogEntry(`❌ CANNOT START RECORDING - exam active: ${examIsActive}, stream available: ${!!streamToUse}`)
+                }
+              } else {
+                // Violation is ongoing - each violation gets its own 10-second recording
+                // Don't cancel timeout - let current recording finish
+                console.log('🔄 Multiple faces violation ongoing - current recording will finish in 10 seconds')
               }
             } else if (confirmedDetection === 'face_not_visible') {
               if (activeFaceNotVisibleViolationRef.current === null) {
                 console.log('⚠️ VIOLATION TRIGGERED: Face Not Visible!')
+                console.log(`📊 Exam active: ${isExamActive}, Media stream: ${!!mediaStreamRef.current}`)
+                
+                // Start violation recording automatically
+                const streamToUse = getMediaStream()
+                const examIsActive = isExamActiveRef.current || isExamActive // Check both ref and state
+                
+                console.log(`🔍 Recording check - examActive (ref): ${isExamActiveRef.current}, examActive (state): ${isExamActive}, stream: ${!!streamToUse}`)
+                
+                if (examIsActive && streamToUse) {
+                  console.log('🎬 Starting face not visible violation recording...')
+                  const detectionTime = new Date()
+                  startViolationRecording(streamToUse, detectionTime, 'face_not_visible').catch((error) => {
+                    console.error('Error starting violation recording:', error)
+                    addLogEntry(`Error starting violation recording: ${error instanceof Error ? error.message : 'Unknown error'}`)
+                  })
+                } else {
+                  console.error(`❌ CANNOT START RECORDING - exam active (ref): ${isExamActiveRef.current}, exam active (state): ${isExamActive}, stream: ${!!streamToUse}`)
+                  addLogEntry(`❌ CANNOT START RECORDING - exam active: ${examIsActive}, stream available: ${!!streamToUse}`)
+                }
+              } else {
+                // Violation is ongoing - each violation gets its own 10-second recording
+                // Don't cancel timeout - let current recording finish
+                console.log('🔄 Face not visible violation ongoing - current recording will finish in 10 seconds')
               }
             }
 
@@ -1504,6 +1597,12 @@ export default function App() {
         rollingBufferRecorderRef.current = null
       }
       
+      // Stop direct violation recorder if active
+      if (violationRecorderRef.current && violationRecorderRef.current.state !== 'inactive') {
+        violationRecorderRef.current.stop()
+        violationRecorderRef.current = null
+      }
+      
       // Stop violation recorder if active (using react-media-recorder)
       if (violationRecordingStatus === 'recording') {
         stopViolationRecordingHook()
@@ -1518,6 +1617,11 @@ export default function App() {
       if (violationTimeoutRef.current) {
         clearTimeout(violationTimeoutRef.current)
         violationTimeoutRef.current = null
+      }
+      
+      if (violationEndTimeoutRef.current) {
+        clearTimeout(violationEndTimeoutRef.current)
+        violationEndTimeoutRef.current = null
       }
       
       // Stop all media stream tracks
@@ -1549,21 +1653,25 @@ export default function App() {
           </h1>
         </div>
 
-        {/* Action Bar */}
-        <div className="bg-green-100 rounded-lg p-4 flex justify-center gap-4">
-          <Button
-            onClick={() => setIsOverlayEnabled(!isOverlayEnabled)}
-            className="bg-teal-600 hover:bg-teal-700 text-white font-semibold px-6 py-2"
-          >
-            {isOverlayEnabled ? 'DISABLE OVERLAY' : 'ENABLE OVERLAY'}
-          </Button>
-        </div>
-
         {/* Video Feed and Log Section - Side by Side */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           {/* Video Feed - Takes 2 columns */}
           <Card className="bg-orange-50 border-orange-200 lg:col-span-2">
             <CardContent className="p-0">
+              {/* MULA PEPERIKSAAN Button at top of webcam area */}
+              <div className="p-4 flex justify-center">
+                <Button
+                  onClick={isExamActive ? handleEndExam : handleStartExam}
+                  disabled={!webcamReady || !modelsLoaded}
+                  className={`font-semibold px-8 py-3 ${
+                    isExamActive
+                      ? 'bg-red-600 hover:bg-red-700 text-white'
+                      : 'bg-green-600 hover:bg-green-700 text-white'
+                  }`}
+                >
+                  {isExamActive ? 'TAMAT PEPERIKSAAN' : 'MULA PEPERIKSAAN'}
+                </Button>
+              </div>
               <div className="relative w-full aspect-video bg-black rounded-lg overflow-hidden">
                 {webcamError ? (
                   <div className="w-full h-full flex flex-col items-center justify-center text-white p-4">
@@ -1609,8 +1717,14 @@ export default function App() {
 
           {/* Log Section - Takes 1 column */}
           <Card className="border-green-200 flex flex-col">
-            <div className="bg-green-100 rounded-t-lg p-3 border-b border-green-200">
+            <div className="bg-green-100 rounded-t-lg p-3 border-b border-green-200 flex items-center justify-between gap-2">
               <h2 className="text-lg font-bold text-gray-900">Log Section</h2>
+              <Button
+                onClick={() => setIsOverlayEnabled(!isOverlayEnabled)}
+                className="bg-teal-600 hover:bg-teal-700 text-white font-semibold px-4 py-1 text-sm"
+              >
+                {isOverlayEnabled ? 'DISABLE OVERLAY' : 'ENABLE OVERLAY'}
+              </Button>
             </div>
             <CardContent className="p-4 flex-1 flex flex-col">
               <Textarea
@@ -1623,28 +1737,6 @@ export default function App() {
           </Card>
         </div>
 
-        {/* Bottom Section */}
-        <div className="flex justify-end items-start gap-4">
-          {/* Navigation Buttons */}
-          <div className="flex gap-4 items-center">
-            <Button
-              className="bg-teal-600 hover:bg-teal-700 text-white font-semibold px-8 py-3"
-            >
-              Sebelum
-            </Button>
-            <Button
-              onClick={isExamActive ? handleEndExam : handleStartExam}
-              disabled={!webcamReady || !modelsLoaded}
-              className={`font-semibold px-8 py-3 ${
-                isExamActive
-                  ? 'bg-red-600 hover:bg-red-700 text-white'
-                  : 'bg-green-600 hover:bg-green-700 text-white'
-              }`}
-            >
-              {isExamActive ? 'TAMAT PEPERIKSAAN' : 'MULA PEPERIKSAAN'}
-            </Button>
-          </div>
-        </div>
 
         {/* Status Messages */}
         {!modelsLoaded && (
