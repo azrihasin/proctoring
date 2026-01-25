@@ -33,7 +33,10 @@
     "lucide-react": "^0.553.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
+    "react-media-recorder": "^1.7.2",
+    "react-record-webcam": "^1.1.5",
     "react-webcam": "^7.2.0",
-    "tailwind-merge": "^3.4.0"
+    "tailwind-merge": "^3.4.0",
+    "webm-duration-fix": "^1.0.4"
   }
 }
