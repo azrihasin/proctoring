@@ -8,7 +8,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { FFmpeg } from '@ffmpeg/ffmpeg'
 import { toBlobURL } from '@ffmpeg/util'
 import { fixWebmMetadata } from '@/lib/utils'
-import { Eye, EyeOff } from 'lucide-react'
+import { Eye, EyeOff, Layers, Square } from 'lucide-react'
 import axios from 'axios'
 // import EKYC from '@/components/EKYC'
 
@@ -212,12 +212,11 @@ export default function App() {
       return sessionId
     } else {
       console.warn('⚠️ Missing URL parameter: idNo not found')
-      // Create a default session ID if parameter is missing
-      const defaultSessionId = `session_${Date.now()}`
-      sessionIdRef.current = defaultSessionId
-      setSessionIdDisplay(defaultSessionId)
-      userIdRef.current = userId || defaultSessionId
-      return defaultSessionId
+      // Set session ID to null when parameter is missing
+      sessionIdRef.current = null
+      setSessionIdDisplay(null)
+      userIdRef.current = userId || null
+      return null
     }
   }, [])
 
@@ -468,7 +467,8 @@ export default function App() {
   const sendVideoToAPI = useCallback(async (
     videoBlob: Blob,
     eventType: string,
-    timestamp: Date
+    startTime: Date,
+    endTime: Date
   ) => {
     if (!sessionIdRef.current) {
       console.warn('⚠️ No session ID available, skipping API call')
@@ -476,23 +476,30 @@ export default function App() {
     }
 
     try {
-      // Format timestamp as ISO string without milliseconds (e.g., "2018-12-30T19:34:50")
-      const timestampStr = timestamp.toISOString().slice(0, 19)
-      
-      // Create JSON body with sessionId, timestamp, and eventType
-      const bodyData = {
+      const url = "https://proctor-x-api.appricode.net/api/proctor/upload"
+
+      // Format timestamps as ISO string without milliseconds (e.g., "2025-12-30T19:34:50")
+      const startTimeStr = startTime.toISOString().slice(0, 19)
+      const endTimeStr = endTime.toISOString().slice(0, 19)
+
+      const payload = {
         sessionId: sessionIdRef.current,
-        timestamp: timestampStr,
-        eventType: eventType
+        startTime: startTimeStr,
+        endTime: endTimeStr,
       }
-      
+
       const formData = new FormData()
-      // Append body as JSON string
-      formData.append('body', JSON.stringify(bodyData))
-      // Append video file
+
+      // Part "data" as application/json (like curl: -F 'data=...;type=application/json')
+      formData.append(
+        "data",
+        new Blob([JSON.stringify(payload)], { type: "application/json" })
+      )
+
+      // Part "file"
       const fileExtension = videoBlob.type.includes('webm') ? 'webm' : 'mp4'
-      const fileName = `${eventType}_${timestampStr.replace(/[:.]/g, '-')}.${fileExtension}`
-      formData.append('file', videoBlob, fileName)
+      const fileName = `${eventType}_${startTimeStr.replace(/[:.]/g, '-')}.${fileExtension}`
+      formData.append("file", videoBlob, fileName)
 
       // Console log for recorded video being sent to API
       console.log('📹 Recorded video sent to API:', {
@@ -501,28 +508,31 @@ export default function App() {
         mimeType: videoBlob.type,
         eventType: eventType,
         sessionId: sessionIdRef.current,
-        timestamp: timestampStr,
+        startTime: startTimeStr,
+        endTime: endTimeStr,
         filename: fileName
       })
 
-      // Send to real API endpoint using axios
-      const response = await axios.post(
-        'https://proctor-x-api.appricode.net/api/proctor/upload',
-        formData,
-        {
-          headers: {
-            'accept': '*/*',
-            'Content-Type': 'multipart/form-data'
-          }
-        }
-      )
-      
-      console.log('✅ Video uploaded successfully:', response.data)
+      const res = await axios.post(url, formData, {
+        headers: {
+          Accept: "application/json",
+          // DO NOT set Content-Type here; axios will set correct multipart boundary
+        },
+      })
+
+      console.log('✅ Video uploaded successfully:', res.data)
     } catch (error) {
-      console.error('❌ Error sending video to API:', error)
+      if (axios.isAxiosError(error)) {
+        const errorMessage = error.response 
+          ? `Upload failed ${error.response.status}: ${error.response.data || error.message}`
+          : error.message
+        console.error('❌ Error sending video to API:', errorMessage)
+      } else {
+        console.error('❌ Error sending video to API:', error)
+      }
       // Error is logged to console but not added to log section
     }
-  }, [addLogEntry])
+  }, [])
 
   // Add recorded video to list
   const addRecordedVideo = useCallback((savedVideo: SavedVideo, filename: string, type: 'exam' | 'violation') => {
@@ -910,9 +920,13 @@ export default function App() {
           }
           const eventType = eventTypeMap[currentViolationType] || currentViolationType || 'unknown'
           
+          // Calculate startTime and endTime for the recording
+          // Recording starts at detectionTime and stops after 10 seconds
+          const startTime = detectionTime
+          const endTime = new Date(detectionTime.getTime() + 10000) // 10 seconds after detection
+          
           // Send video to API
-          const currentTimestamp = new Date()
-          sendVideoToAPI(fixedBlob, eventType, currentTimestamp).catch((error) => {
+          sendVideoToAPI(fixedBlob, eventType, startTime, endTime).catch((error) => {
             console.error('Error sending video to API:', error)
           })
           
@@ -1797,11 +1811,6 @@ export default function App() {
           >
             {isExamActive ? 'TAMAT PEPERIKSAAN' : 'MULA PEPERIKSAAN'}
           </Button>
-          {sessionIdDisplay && (
-            <div className="text-xs text-gray-600 bg-gray-100 px-3 py-1.5 rounded-md border border-gray-300">
-              <span className="font-semibold text-gray-700">Session ID:</span> {sessionIdDisplay}
-            </div>
-          )}
           <Button
             onClick={() => setIsViewVisible(!isViewVisible)}
             variant="ghost"
@@ -1867,14 +1876,27 @@ export default function App() {
 
           {/* Log Section - Takes 1 column */}
           <Card className="border-green-200 flex flex-col">
-            <div className="bg-green-100 rounded-t-lg p-3 border-b border-green-200 flex items-center justify-between gap-2">
-              <h2 className="text-lg font-bold text-gray-900">Log Section</h2>
-              <Button
-                onClick={() => setIsOverlayEnabled(!isOverlayEnabled)}
-                className="bg-teal-600 hover:bg-teal-700 text-white font-semibold px-4 py-1 text-sm"
-              >
-                {isOverlayEnabled ? 'DISABLE OVERLAY' : 'ENABLE OVERLAY'}
-              </Button>
+            <div className="bg-green-100 rounded-t-lg p-3 border-b border-green-200">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-3">
+                  <h2 className="text-lg font-bold text-gray-900">Log Section</h2>
+                  <div className="text-xs text-gray-600 bg-gray-100 px-3 py-1.5 rounded-md border border-gray-300">
+                    <span className="font-semibold text-gray-700">Session ID:</span> {sessionIdDisplay || 'No Session ID'}
+                  </div>
+                </div>
+                <Button
+                  onClick={() => setIsOverlayEnabled(!isOverlayEnabled)}
+                  size="icon"
+                  className="bg-teal-600 hover:bg-teal-700 text-white"
+                  title={isOverlayEnabled ? 'Disable Overlay' : 'Enable Overlay'}
+                >
+                  {isOverlayEnabled ? (
+                    <Layers className="w-5 h-5" />
+                  ) : (
+                    <Square className="w-5 h-5" />
+                  )}
+                </Button>
+              </div>
             </div>
             <CardContent className="p-4 flex-1 flex flex-col">
               <Textarea
