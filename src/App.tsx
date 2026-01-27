@@ -9,6 +9,7 @@ import { FFmpeg } from '@ffmpeg/ffmpeg'
 import { toBlobURL } from '@ffmpeg/util'
 import { fixWebmMetadata } from '@/lib/utils'
 import { Eye, EyeOff } from 'lucide-react'
+import axios from 'axios'
 // import EKYC from '@/components/EKYC'
 
 type DetectionType = 'cell_phone' | 'multiple_faces' | 'face_not_visible' | 'tab_switch' | null
@@ -71,6 +72,20 @@ export default function App() {
   const activeCellPhoneViolationRef = useRef<number | null>(null) // Index of active cell_phone violation in violations array
   const activeMultipleFacesViolationRef = useRef<number | null>(null) // Index of active multiple_faces violation in violations array
   const activeTabSwitchViolationRef = useRef<number | null>(null) // Index of active tab_switch violation in violations array
+  
+  // Session ID from URL parameters
+  const sessionIdRef = useRef<string | null>(null)
+  const [sessionIdDisplay, setSessionIdDisplay] = useState<string | null>(null)
+  
+  // User ID from URL parameters
+  const userIdRef = useRef<string | null>(null)
+  
+  // Track last log time per log message type for throttling
+  const lastLogTimeRef = useRef<Map<string, number>>(new Map())
+  
+  // Track consecutive detection counts per event type for API sending
+  const eventDetectionCountRef = useRef<Map<string, number>>(new Map()) // eventType -> count
+  const eventFirstDetectionRef = useRef<Map<string, boolean>>(new Map()) // eventType -> isFirstDetection
   
   // Exam recording state
   const [isExamActive, setIsExamActive] = useState(false)
@@ -160,11 +175,7 @@ export default function App() {
 
   // Log when recorded videos changes
   useEffect(() => {
-    console.log(`📹 Recorded videos state updated! Total count: ${recordedVideos.length}`)
-    if (recordedVideos.length > 0) {
-      const latest = recordedVideos[recordedVideos.length - 1]
-      console.log(`   Latest video: ${latest.filename} (${latest.type})`)
-    }
+    // Removed console.log statements
   }, [recordedVideos])
 
   // Auto-scroll log section to bottom when new entries are added
@@ -187,6 +198,29 @@ export default function App() {
   // FFmpeg instance for video conversion
   const ffmpegRef = useRef<FFmpeg | null>(null)
 
+  // Extract URL parameters and create session ID
+  const extractSessionId = useCallback(() => {
+    const urlParams = new URLSearchParams(window.location.search)
+    const idNo = urlParams.get('idNo')
+    const userId = urlParams.get('userId') || idNo // Use userId param if available, otherwise use idNo
+    
+    if (idNo) {
+      const sessionId = idNo
+      sessionIdRef.current = sessionId
+      setSessionIdDisplay(sessionId)
+      userIdRef.current = userId || sessionId // Use userId if provided, otherwise use sessionId
+      return sessionId
+    } else {
+      console.warn('⚠️ Missing URL parameter: idNo not found')
+      // Create a default session ID if parameter is missing
+      const defaultSessionId = `session_${Date.now()}`
+      sessionIdRef.current = defaultSessionId
+      setSessionIdDisplay(defaultSessionId)
+      userIdRef.current = userId || defaultSessionId
+      return defaultSessionId
+    }
+  }, [])
+
   // Get video element from webcam ref
   const getVideoElement = useCallback(() => {
     return webcamRef.current?.video
@@ -194,13 +228,9 @@ export default function App() {
 
   // Get media stream reliably - tries multiple sources
   const getMediaStream = useCallback((): MediaStream | null => {
-    console.log('🔍 getMediaStream called')
-    
     // First try mediaStreamRef
     if (mediaStreamRef.current) {
-      console.log(`📹 mediaStreamRef exists: active=${mediaStreamRef.current.active}, id=${mediaStreamRef.current.id}`)
       if (mediaStreamRef.current.active) {
-        console.log('✅ Using stream from mediaStreamRef')
         return mediaStreamRef.current
       } else {
         console.warn('⚠️ mediaStreamRef stream is not active')
@@ -211,13 +241,10 @@ export default function App() {
     
     // Then try video element
     const videoElement = webcamRef.current?.video
-    console.log(`📹 Video element: ${videoElement ? 'exists' : 'null'}, srcObject: ${videoElement?.srcObject ? 'exists' : 'null'}`)
     
     if (videoElement && videoElement.srcObject) {
       const stream = videoElement.srcObject as MediaStream
-      console.log(`📹 Stream from video: active=${stream?.active}, id=${stream?.id}`)
       if (stream && stream.active) {
-        console.log('✅ Using stream from video element')
         // Update mediaStreamRef for future use
         mediaStreamRef.current = stream
         return stream
@@ -243,7 +270,6 @@ export default function App() {
           wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
         })
 
-        console.log('✅ FFmpeg loaded successfully')
       } catch (error) {
         console.error('Error loading FFmpeg:', error)
       }
@@ -259,7 +285,6 @@ export default function App() {
     const mimeType = fixedWebmBlob.type || getBestMimeType()
     const ext = mimeType.includes('webm') ? 'webm' : 'mp4'
     
-    console.log(`✅ Video saved in original format: ${ext}`)
     return { blob: fixedWebmBlob, mime: mimeType, ext: ext as 'mp4' | 'webm', converted: false }
   }, [getBestMimeType])
 
@@ -269,7 +294,6 @@ export default function App() {
     mediaStreamRef.current = stream
     setWebcamReady(true)
     setWebcamError(null)
-    console.log('Webcam initialized successfully')
   }, [])
 
   // Handle webcam error
@@ -289,12 +313,114 @@ export default function App() {
 
 
 
-  // Add log entry helper
+  // API function to send log event
+  const sendLogToAPI = useCallback(async (eventType: string, timestamp: Date) => {
+    if (!sessionIdRef.current) {
+      console.warn('⚠️ No session ID available, skipping API call')
+      return
+    }
+
+    try {
+      // Format timestamp as ISO string without milliseconds (e.g., "2018-12-30T19:34:50")
+      const timestampStr = timestamp.toISOString().slice(0, 19)
+      
+      // Convert sessionId to number (parse as integer)
+      const sessionIdNum = parseInt(sessionIdRef.current, 10)
+      if (isNaN(sessionIdNum)) {
+        console.warn('⚠️ Session ID is not a valid number, skipping API call')
+        return
+      }
+      
+      const body = {
+        sessionId: sessionIdNum,
+        timestamp: timestampStr,
+        eventType: eventType
+      }
+
+      // Console log for log event being sent to API
+      console.log('📝 Log event sent to API:', body)
+
+      // Send to real API endpoint
+      const response = await fetch('https://proctor-x-api.appricode.net/api/proctor/event', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body)
+      })
+      
+      if (!response.ok) {
+        throw new Error(`API call failed: ${response.statusText}`)
+      }
+      
+      const result = await response.json()
+      console.log('✅ Log event sent successfully:', result)
+    } catch (error) {
+      console.error('❌ Error sending log to API:', error)
+      // Don't add log entry for API errors to avoid infinite loops
+    }
+  }, [])
+
+  // Map violation types to eventType format for API
+  const getEventTypeFromMessage = useCallback((message: string): string | null => {
+    const messageLower = message.toLowerCase()
+    if (messageLower.includes('cell phone') || messageLower.includes('phone')) {
+      return 'phone'
+    } else if (messageLower.includes('face not visible') || messageLower.includes('face-not-visible')) {
+      return 'face-not-visible'
+    } else if (messageLower.includes('multiple faces') || messageLower.includes('multiple-faces')) {
+      return 'multiple-faces'
+    } else if (messageLower.includes('tab switch') || messageLower.includes('tab-switch')) {
+      return 'tab-switch'
+    }
+    return null
+  }, [])
+
+  // Map DetectionType to eventType format
+  const getEventTypeFromDetectionType = useCallback((detectionType: DetectionType): string | null => {
+    if (detectionType === 'cell_phone') {
+      return 'phone'
+    } else if (detectionType === 'face_not_visible') {
+      return 'face-not-visible'
+    } else if (detectionType === 'multiple_faces') {
+      return 'multiple-faces'
+    } else if (detectionType === 'tab_switch') {
+      return 'tab-switch'
+    }
+    return null
+  }, [])
+
+  // Reset detection count for an event type when violation ends
+  const resetEventDetectionCount = useCallback((detectionType: DetectionType) => {
+    const eventType = getEventTypeFromDetectionType(detectionType)
+    if (eventType) {
+      eventDetectionCountRef.current.set(eventType, 0)
+      eventFirstDetectionRef.current.set(eventType, true) // Reset to allow first detection again
+    }
+  }, [getEventTypeFromDetectionType])
+
+  // Add log entry helper with throttling for repeating logs
   const addLogEntry = useCallback((message: string) => {
     // Only add logs when exam is active
     if (!isExamActiveRef.current) {
       return
     }
+    
+    const now = Date.now()
+    const lastLogTime = lastLogTimeRef.current.get(message) || 0
+    const timeSinceLastLog = now - lastLogTime
+    const THROTTLE_INTERVAL_MS = 10000 // 10 seconds
+    
+    // For repeating logs, only show if 10 seconds have passed since last occurrence
+    if (timeSinceLastLog < THROTTLE_INTERVAL_MS && lastLogTime > 0) {
+      // Skip this log entry - it's a repeat within 10 seconds
+      // Don't increment API count or send API events for skipped logs
+      return
+    }
+    
+    // Update last log time for this message
+    lastLogTimeRef.current.set(message, now)
+    
     const timestamp = new Date().toLocaleString('en-US', {
       month: '2-digit',
       day: '2-digit',
@@ -306,13 +432,100 @@ export default function App() {
     })
     const logMessage = `${timestamp} ${message}`
     setLogEntries(prev => [...prev.slice(-99), logMessage]) // Keep last 100 entries
-  }, [])
+    
+    // Handle API sending based on consecutive log entries that actually appear in the log section
+    // Only track and send API events for logs that pass the throttling check above
+    const eventType = getEventTypeFromMessage(message)
+    if (eventType) {
+      const currentCount = eventDetectionCountRef.current.get(eventType) || 0
+      const isFirstDetection = eventFirstDetectionRef.current.get(eventType) !== false
+      
+      // Increment count only for logs that actually appear in the log section
+      const newCount = currentCount + 1
+      eventDetectionCountRef.current.set(eventType, newCount)
+      
+      // Send to API only on first log entry or every 10th consecutive log entry of same type
+      // For consecutive log entries (2nd-9th), don't send - only send 1 log total for those entries
+      if (isFirstDetection) {
+        // First log entry of this event type - send immediately
+        eventFirstDetectionRef.current.set(eventType, false)
+        sendLogToAPI(eventType, new Date()).catch((error) => {
+          console.error('Error sending log to API:', error)
+        })
+      } else if (newCount === 10) {
+        // Exactly 10th consecutive log entry - send to API and reset count to start cycle again
+        eventDetectionCountRef.current.set(eventType, 0) // Reset to 0
+        eventFirstDetectionRef.current.set(eventType, true) // Mark as first again for next cycle
+        sendLogToAPI(eventType, new Date()).catch((error) => {
+          console.error('Error sending log to API:', error)
+        })
+      }
+      // For counts 2-9, don't send anything - only 1 log was sent on first log entry
+    }
+  }, [getEventTypeFromMessage, sendLogToAPI])
+
+  // API function to send video
+  const sendVideoToAPI = useCallback(async (
+    videoBlob: Blob,
+    eventType: string,
+    timestamp: Date
+  ) => {
+    if (!sessionIdRef.current) {
+      console.warn('⚠️ No session ID available, skipping API call')
+      return
+    }
+
+    try {
+      // Format timestamp as ISO string without milliseconds (e.g., "2018-12-30T19:34:50")
+      const timestampStr = timestamp.toISOString().slice(0, 19)
+      
+      // Create JSON body with sessionId, timestamp, and eventType
+      const bodyData = {
+        sessionId: sessionIdRef.current,
+        timestamp: timestampStr,
+        eventType: eventType
+      }
+      
+      const formData = new FormData()
+      // Append body as JSON string
+      formData.append('body', JSON.stringify(bodyData))
+      // Append video file
+      const fileExtension = videoBlob.type.includes('webm') ? 'webm' : 'mp4'
+      const fileName = `${eventType}_${timestampStr.replace(/[:.]/g, '-')}.${fileExtension}`
+      formData.append('file', videoBlob, fileName)
+
+      // Console log for recorded video being sent to API
+      console.log('📹 Recorded video sent to API:', {
+        blobSize: videoBlob.size,
+        blobSizeMB: (videoBlob.size / (1024 * 1024)).toFixed(2) + ' MB',
+        mimeType: videoBlob.type,
+        eventType: eventType,
+        sessionId: sessionIdRef.current,
+        timestamp: timestampStr,
+        filename: fileName
+      })
+
+      // Send to real API endpoint using axios
+      const response = await axios.post(
+        'https://proctor-x-api.appricode.net/api/proctor/upload',
+        formData,
+        {
+          headers: {
+            'accept': '*/*',
+            'Content-Type': 'multipart/form-data'
+          }
+        }
+      )
+      
+      console.log('✅ Video uploaded successfully:', response.data)
+    } catch (error) {
+      console.error('❌ Error sending video to API:', error)
+      // Error is logged to console but not added to log section
+    }
+  }, [addLogEntry])
 
   // Add recorded video to list
   const addRecordedVideo = useCallback((savedVideo: SavedVideo, filename: string, type: 'exam' | 'violation') => {
-    console.log(`📥 addRecordedVideo called: ${filename}, type: ${type}`)
-    console.log(`📊 Video size: ${savedVideo.blob.size} bytes, ext: ${savedVideo.ext}`)
-    
     // Store the blob directly - React state will keep it in memory
     // The blob should remain valid as long as it's in state
     const recordedVideo: RecordedVideo = {
@@ -328,98 +541,11 @@ export default function App() {
       mp4Blob: savedVideo.converted && savedVideo.ext === 'mp4' ? savedVideo.blob : undefined,
     }
     
-    console.log(`🔄 Updating recordedVideos state...`)
     setRecordedVideos(prev => {
       const newList = [...prev, recordedVideo]
-      console.log(`✅ State updated! Total videos now: ${newList.length}`)
       return newList
     })
-    
-    console.log(`✅ Video added to list: ${filename} (${(savedVideo.blob.size / (1024 * 1024)).toFixed(2)} MB, type: ${savedVideo.mime}, converted: ${savedVideo.converted})`)
   }, [])
-
-  // Don't process final exam video - we're not recording the exam anymore
-  // This effect is disabled since we only record violations
-
-  // Process violation video when blob becomes available (moved after function definitions)
-  // NOTE: This is now handled directly in processViolationVideoDirectly() called from recorder.onstop
-  // Keeping this commented out for reference
-  /*
-  useEffect(() => {
-    console.log('🔍 Process violation video effect triggered', {
-      violationMediaBlobUrl: !!violationMediaBlobUrl,
-      violationDetectionTimeRef: !!violationDetectionTimeRef.current,
-      activeViolationTypeRef: activeViolationTypeRef.current
-    })
-    
-    if (violationMediaBlobUrl && violationDetectionTimeRef.current && activeViolationTypeRef.current) {
-      const processViolationVideo = async () => {
-        try {
-          console.log('🎬 Starting violation video processing...')
-          // Fetch the blob from the URL
-          const response = await fetch(violationMediaBlobUrl!)
-          const blob = await response.blob()
-          
-          console.log('🛑 Violation recorder stopped, processing video...')
-          console.log(`📦 Blob fetched: size=${blob.size}, type=${blob.type}`)
-          
-          const bufferChunks = rollingBufferRef.current.map(item => item.blob)
-
-          console.log(`📹 Buffer chunks: ${bufferChunks.length}, After blob size: ${blob.size}`)
-
-          if (bufferChunks.length === 0 && blob.size === 0) {
-            console.warn('⚠️ No video chunks available for violation recording')
-            addLogEntry('⚠️ No video chunks for violation')
-            return
-          }
-
-          addLogEntry('Preparing violation video (concat)...')
-          console.log('🔄 Starting concat...')
-
-          // concat before+after chunks (no conversion)
-          const result = await concatWebmChunks(bufferChunks, [blob])
-          console.log(`✅ Concat complete: ${result.ext}, size: ${result.blob.size} bytes`)
-
-          // extra safety: if video is suspiciously small, skip
-          if (result.blob.size < 50_000) {
-            console.warn('Video too small, skipping save')
-            addLogEntry('Violation video too small, skipping save')
-            return
-          }
-
-          const timestamp = violationDetectionTimeRef.current!.toISOString().replace(/[:.]/g, '-').slice(0, -5)
-          const violationType = activeViolationTypeRef.current || 'unknown'
-          const violationTypeStr = violationType === 'cell_phone' ? 'cell_phone_detection' :
-                                   violationType === 'multiple_faces' ? 'multiple_faces_detection' :
-                                   violationType === 'face_not_visible' ? 'face_not_visible_detection' :
-                                   'violation'
-          const filename = `${violationTypeStr}_${timestamp}.${result.ext}`
-
-          console.log(`💾 Adding violation video to list: ${filename}`)
-          console.log(`📊 Video details: type=${violationType}, size=${result.blob.size}, ext=${result.ext}`)
-          
-          // Add to recorded videos list immediately
-          addRecordedVideo(result, filename, 'violation')
-          addLogEntry(`✅ Violation video recorded and added to list: ${filename}`)
-
-          console.log(`✅ Violation video added to download list: ${filename}`)
-          
-          // Clear the detection time ref, violation type, and blob URL after processing
-          violationDetectionTimeRef.current = null
-          activeViolationTypeRef.current = null
-          clearViolationBlobUrl()
-        } catch (error) {
-          console.error('❌ Error processing violation video:', error)
-          addLogEntry(`Error processing violation video: ${error instanceof Error ? error.message : 'Unknown error'}`)
-          violationDetectionTimeRef.current = null
-          activeViolationTypeRef.current = null
-        }
-      }
-      
-      processViolationVideo()
-    }
-  }, [violationMediaBlobUrl, concatWebmChunks, addRecordedVideo, addLogEntry, getBestMimeType, clearViolationBlobUrl])
-  */
 
   // MediaRecorder for chunk access (needed for periodic saving)
   const examChunkRecorderRef = useRef<MediaRecorder | null>(null)
@@ -441,7 +567,6 @@ export default function App() {
     try {
       // Ensure mediaStreamRef is set to the current stream
       mediaStreamRef.current = stream
-      console.log(`✅ Stream stored in mediaStreamRef: ${stream.id}, active=${stream.active}, videoTracks=${stream.getVideoTracks().length}`)
       
       // Verify stream is active
       if (!stream.active) {
@@ -455,6 +580,7 @@ export default function App() {
       setRecordingDuration(0)
       setViolations([])
       setLogEntries([]) // Clear all logs when exam starts
+      lastLogTimeRef.current.clear() // Clear log throttle map when exam starts
       activeFaceNotVisibleViolationRef.current = null // Reset active face_not_visible violation
       activeCellPhoneViolationRef.current = null // Reset active cell_phone violation
       activeMultipleFacesViolationRef.current = null // Reset active multiple_faces violation
@@ -475,8 +601,11 @@ export default function App() {
         setRecordingDuration(elapsed)
       }, 1000)
 
+      // Reset detection counts and first detection flags when exam starts
+      eventDetectionCountRef.current.clear()
+      eventFirstDetectionRef.current.clear()
+
       // NO exam video segments - NO periodic recording
-      console.log('✅ Exam started - NO RECORDING STARTED. Only timer started. Recording will begin ONLY when violations are detected.')
     } catch (error) {
       console.error('Error starting exam recording:', error)
       setIsExamActive(false)
@@ -494,7 +623,6 @@ export default function App() {
       v.onloadedmetadata = () => {
         const duration = v.duration
         const isValid = isFinite(duration) && duration > 0 && !isNaN(duration)
-        console.log(`📊 Blob validation - Duration: ${duration}, ReadyState: ${v.readyState}, Valid: ${isValid}`)
         URL.revokeObjectURL(url)
         resolve({ duration, isValid })
       }
@@ -533,14 +661,10 @@ export default function App() {
       const blobToDownload = video.blob
       const filename = video.filename
 
-      console.log('📥 Download initiated for:', filename, 'Size:', blobToDownload.size, 'Type:', blobToDownload.type)
-      
       // Validate blob duration (async, but don't block download)
       validateBlobDuration(blobToDownload).then(({ duration, isValid }) => {
         if (!isValid) {
           console.warn(`⚠️ Blob may have duration/scrubbing issues (duration: ${duration})`)
-        } else {
-          console.log(`✅ Blob validated successfully (duration: ${duration.toFixed(2)}s)`)
         }
       }).catch(err => {
         console.warn('Blob validation error:', err)
@@ -561,10 +685,7 @@ export default function App() {
       setTimeout(() => {
         document.body.removeChild(a)
         URL.revokeObjectURL(url)
-        console.log('🧹 Cleaned up download link and object URL')
       }, 100)
-
-      console.log(`✅ Video download initiated: ${filename} (${(blobToDownload.size / (1024 * 1024)).toFixed(2)} MB)`)
     } catch (error) {
       console.error('Error downloading video:', error)
     }
@@ -596,9 +717,8 @@ export default function App() {
       }
       
       // Stop all active violation recorders
-      for (const [violationType, recorder] of violationRecordersRef.current.entries()) {
+      for (const [, recorder] of violationRecordersRef.current.entries()) {
         if (recorder && recorder.state === 'recording') {
-          console.log(`⏹️ Stopping ${violationType} violation recorder...`)
           recorder.stop()
         }
       }
@@ -629,6 +749,10 @@ export default function App() {
       // Don't stop exam recording - we're not recording the exam anymore
       // stopExamRecording() // Disabled - only recording violations
       
+      // Reset detection counts when exam ends
+      eventDetectionCountRef.current.clear()
+      eventFirstDetectionRef.current.clear()
+      
       // No final exam video to save - only violation recordings are saved
 
         setIsExamActive(false)
@@ -649,12 +773,8 @@ export default function App() {
   const startViolationRecording = useCallback(async (stream: MediaStream, detectionTime: Date, violationType: DetectionType) => {
     if (!violationType) return
     
-    console.log(`🎥🎥🎥 DIRECT startViolationRecording CALLED for ${violationType}`)
-    console.log(`📊 Stream info: active=${stream.active}, id=${stream.id}, videoTracks=${stream.getVideoTracks().length}`)
-    
     // Check if a recording for this violation type is already in progress
     if (activeRecordingByTypeRef.current.get(violationType) === true) {
-      console.log(`⏭️ Ignoring ${violationType} violation - recording already in progress for this type`)
       return
     }
     
@@ -679,26 +799,21 @@ export default function App() {
     
     // Mark this violation type as being recorded
     activeRecordingByTypeRef.current.set(violationType, true)
-    console.log(`✅ Marked ${violationType} as being recorded`)
     
     // Initialize chunks array for this violation type
     violationChunksByTypeRef.current.set(violationType, [])
     violationDetectionTimesRef.current.set(violationType, detectionTime)
 
     try {
-      console.log(`📝 Starting recording for ${violationType} at ${detectionTime.toISOString()}`)
-      
       // Clear any existing timeout for this violation type
       const existingTimeout = violationTimeoutsRef.current.get(violationType)
       if (existingTimeout) {
-        console.log(`🔄 Clearing existing timeout for ${violationType}`)
         clearTimeout(existingTimeout)
         violationTimeoutsRef.current.delete(violationType)
       }
       
       // Create MediaRecorder for this specific violation type
       const mimeType = getBestMimeType()
-      console.log(`📹 Using MIME type: ${mimeType} for ${violationType}`)
       const options = { mimeType, videoBitsPerSecond: 1500000 }
       
       // Check if MediaRecorder is supported
@@ -708,8 +823,6 @@ export default function App() {
       
       const recorder = new MediaRecorder(stream, options)
       violationRecordersRef.current.set(violationType, recorder)
-      
-      console.log(`📹 MediaRecorder created for ${violationType}: state=${recorder.state}, mimeType=${recorder.mimeType}`)
       
       // Capture violationType in closure for event handlers
       const currentViolationType = violationType
@@ -721,23 +834,17 @@ export default function App() {
           const currentChunks = violationChunksByTypeRef.current.get(currentViolationType) || []
           currentChunks.push(event.data)
           violationChunksByTypeRef.current.set(currentViolationType, currentChunks)
-          console.log(`📦 ${currentViolationType} chunk received: ${event.data.size} bytes, total chunks: ${currentChunks.length}`)
         } else {
           console.warn(`⚠️ Empty chunk received for ${currentViolationType}`)
         }
       }
       
       recorder.onstop = async () => {
-        console.log(`🛑 🛑 🛑 Violation recorder ONSTOP fired for ${currentViolationType}!`)
-        
         // Wait a moment to ensure all data is available
         await new Promise(resolve => setTimeout(resolve, 100))
         
         const chunks = violationChunksByTypeRef.current.get(currentViolationType) || []
         const detectionTime = violationDetectionTimesRef.current.get(currentViolationType)
-        
-        console.log(`📊 ${currentViolationType} chunks count: ${chunks.length}`)
-        console.log(`📝 ${currentViolationType} detection time: ${detectionTime}`)
         
         // Process video directly here to avoid closure issues
         if (chunks.length === 0) {
@@ -760,11 +867,8 @@ export default function App() {
         
         try {
           const currentMimeType = getBestMimeType()
-          const totalSize = chunks.reduce((sum, chunk) => sum + chunk.size, 0)
-          console.log(`📦 Creating blob from ${chunks.length} chunks for ${currentViolationType}, total size: ${totalSize} bytes`)
           
           const blob = new Blob(chunks, { type: currentMimeType })
-          console.log(`📦 Created blob for ${currentViolationType}: ${blob.size} bytes, type: ${blob.type}`)
           
           if (blob.size < 50_000) {
             console.error(`❌ Video too small for ${currentViolationType}: ${blob.size} bytes (expected at least 50KB)`)
@@ -776,9 +880,7 @@ export default function App() {
           }
           
           // Fix metadata
-          console.log(`🔧 Fixing WebM metadata for ${currentViolationType}...`)
           const fixedBlob = await fixWebmMetadata(blob)
-          console.log(`✅ Metadata fixed for ${currentViolationType}: ${fixedBlob.size} bytes`)
           
           const ext = currentMimeType.includes('webm') ? 'webm' : 'mp4'
           const result: SavedVideo = { 
@@ -796,13 +898,23 @@ export default function App() {
                                    'violation'
           const filename = `${violationTypeStr}_${timestamp}.${result.ext}`
 
-          console.log(`💾💾💾 ADDING VIDEO TO LIST NOW: ${filename} (${(fixedBlob.size / (1024 * 1024)).toFixed(2)} MB)`)
-          
           // Add to recorded videos list immediately
           addRecordedVideo(result, filename, 'violation')
-
-          console.log(`✅✅✅ VIDEO ADDED TO LIST: ${filename}`)
-          console.log(`🔔 Check the UI - video should be visible now!`)
+          
+          // Map violation type to eventType format
+          const eventTypeMap: Record<string, string> = {
+            'cell_phone': 'phone',
+            'face_not_visible': 'face-not-visible',
+            'multiple_faces': 'multiple-faces',
+            'tab_switch': 'tab-switch'
+          }
+          const eventType = eventTypeMap[currentViolationType] || currentViolationType || 'unknown'
+          
+          // Send video to API
+          const currentTimestamp = new Date()
+          sendVideoToAPI(fixedBlob, eventType, currentTimestamp).catch((error) => {
+            console.error('Error sending video to API:', error)
+          })
           
           // Clear refs and recording flag for this violation type
           activeRecordingByTypeRef.current.set(currentViolationType, false)
@@ -810,8 +922,6 @@ export default function App() {
           violationChunksByTypeRef.current.delete(currentViolationType)
           violationDetectionTimesRef.current.delete(currentViolationType)
           violationTimeoutsRef.current.delete(currentViolationType)
-          
-          console.log(`✅ Cleared all refs for ${currentViolationType}`)
         } catch (error) {
           console.error(`❌❌❌ ERROR in onstop processing for ${currentViolationType}:`, error)
           // Clear recording flag even on error
@@ -835,7 +945,6 @@ export default function App() {
       // Start recording
       try {
         recorder.start(1000) // 1 second chunks
-        console.log(`🎬🎬🎬 RECORDING STARTED - Violation: ${violationType}, state=${recorder.state}`)
       } catch (startError) {
         console.error(`❌ Error starting recorder for ${violationType}:`, startError)
         activeRecordingByTypeRef.current.set(violationType, false)
@@ -848,17 +957,13 @@ export default function App() {
       // Schedule stop after exactly 10 seconds from detection time
       // This ensures recording continues for 10 seconds including during the violation
       const timeoutId = window.setTimeout(async () => {
-        console.log(`⏰ 10 seconds after ${violationType} violation detected, stopping recorder NOW...`)
-        
         const recorder = violationRecordersRef.current.get(violationType)
         if (recorder && recorder.state === 'recording') {
-          console.log(`⏹️ Stopping ${violationType} violation recorder...`)
           // Request any pending data before stopping
           recorder.requestData()
           // Wait a bit for data to be available
           await new Promise(resolve => setTimeout(resolve, 200))
           recorder.stop()
-          console.log(`🛑 ${violationType} recorder stop called - onstop will process video`)
         } else {
           console.warn(`⚠️ ${violationType} recorder state: ${recorder?.state || 'null'}`)
           // Clear flag even if recorder is not active
@@ -871,7 +976,6 @@ export default function App() {
       }, 10000) // 10 seconds after detection
       
       violationTimeoutsRef.current.set(violationType, timeoutId)
-      console.log(`✅ Violation stop scheduled for ${violationType} in 10 seconds`)
     } catch (error) {
       console.error(`❌ Error starting violation recording for ${violationType}:`, error)
       activeRecordingByTypeRef.current.set(violationType, false)
@@ -879,7 +983,7 @@ export default function App() {
       violationChunksByTypeRef.current.delete(violationType)
       violationDetectionTimesRef.current.delete(violationType)
     }
-  }, [addLogEntry, getBestMimeType, addRecordedVideo, validateBlobDuration])
+  }, [addLogEntry, getBestMimeType, addRecordedVideo, validateBlobDuration, sendVideoToAPI])
 
 
   // Add violation to list when detected
@@ -945,7 +1049,6 @@ export default function App() {
           : 'Violation Detected'
         addLogEntry(violationMessage)
         
-        console.log(`📝 ${type} violation started:`, violation)
         return newViolations
       })
     } else {
@@ -968,14 +1071,11 @@ export default function App() {
       const violationMessage = 'Violation Detected'
       addLogEntry(violationMessage)
       
-      console.log('📝 Violation recorded:', violation)
     }
   }, [addLogEntry])
 
   const loadMediaPipeModels = async () => {
     try {
-      console.log('Loading MediaPipe models for face and object detection...')
-      
       // Initialize MediaPipe vision tasks
       const vision = await FilesetResolver.forVisionTasks(
         'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
@@ -993,7 +1093,6 @@ export default function App() {
       })
       
       faceDetectorRef.current = faceDetector
-      console.log('✅ MediaPipe Face Detector loaded successfully')
       
       // Load Object Detector for smartphone detection
       const objectDetector = await ObjectDetector.createFromOptions(vision, {
@@ -1002,13 +1101,12 @@ export default function App() {
           delegate: 'GPU'
         },
         runningMode: 'VIDEO',
-        scoreThreshold: 0.3, // Lowered from 0.5 for better phone detection
+        scoreThreshold: 0.42, // Set to 42% for smooth cell phone detection
         maxResults: 10 // Increased to see more detections
         // Removed categoryAllowlist to detect all objects and filter manually
       })
       
       objectDetectorRef.current = objectDetector
-      console.log('✅ MediaPipe Object Detector loaded successfully')
       
       setModelsLoaded(true)
 
@@ -1016,8 +1114,6 @@ export default function App() {
       detectionIntervalRef.current = window.setInterval(() => {
         detectWithMediaPipe()
       }, 100)
-      
-      console.log('✅ All MediaPipe models loaded successfully')
     } catch (error) {
       console.error('Error loading MediaPipe models:', error)
     }
@@ -1109,8 +1205,8 @@ export default function App() {
                                    categoryLower.includes('mobile') ||
                                    categoryLower === 'cell phone'
                 
-                // ONLY draw and process cell phones with more than 45% confidence - ignore all other objects
-                if (!isCellPhone || category.score <= 0.45) return
+                // ONLY draw and process cell phones with 42% or more confidence - ignore all other objects
+                if (!isCellPhone || category.score < 0.42) return
                 
                 const bbox = detection.boundingBox
                 if (bbox) {
@@ -1168,7 +1264,7 @@ export default function App() {
               )
             }
             
-            // Display cell phone detection count at bottom (only count detections with >45% confidence)
+            // Display cell phone detection count at bottom (only count detections with >=42% confidence)
             const cellPhoneCount = objectResults.detections ? 
               objectResults.detections.filter(detection => {
                 if (!detection.categories || detection.categories.length === 0) return false
@@ -1178,7 +1274,7 @@ export default function App() {
                                categoryLower.includes('phone') ||
                                categoryLower.includes('mobile') ||
                                categoryLower === 'cell phone'
-                return isPhone && category.score > 0.45
+                return isPhone && category.score >= 0.42
               }).length : 0
             
             if (cellPhoneCount > 0) {
@@ -1194,10 +1290,10 @@ export default function App() {
             }
 
           // Detection thresholds for MediaPipe
-          const REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE = 3 // 3 frames (0.3 seconds) - faster response with more accurate detection
+          const REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE = 2 // 2 frames (0.2 seconds) - smooth detection with higher confidence
           const REQUIRED_CONSECUTIVE_DETECTIONS_MULTIPLE_FACES = 8 // 8 frames (0.8 seconds) - reduced from 10 with better NMS
           const REQUIRED_CONSECUTIVE_FACE_MISSES = 20 // 20 frames (2.0 seconds)
-          const CELL_PHONE_DEBOUNCE_MS = 1000 // 1 second debounce
+          const CELL_PHONE_DEBOUNCE_MS = 800 // 0.8 seconds debounce for smoother detection
           
           let currentDetection: DetectionType = null
           
@@ -1222,13 +1318,11 @@ export default function App() {
                                categoryLower === 'mobile phone' ||
                                categoryLower === 'smartphone'
                 
-                // Only consider detections with more than 45% confidence
-                if (isPhone && category.score > 0.45) {
+                // Only consider detections with 42% or more confidence for smooth detection
+                if (isPhone && category.score >= 0.42) {
                   isCellPhoneDetected = true
                   cellPhoneScore = Math.max(cellPhoneScore, category.score)
                   
-                  // Always log phone detections
-                  console.log(`📱 CELL PHONE DETECTED: "${category.categoryName}" (${(category.score * 100).toFixed(1)}%)`)
                 }
               }
             })
@@ -1262,7 +1356,6 @@ export default function App() {
                   ...updated[activeIndex],
                   endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
                 }
-                console.log('✅ Cell phone violation ended (no phone detected)')
                 
                 // Violation recording stops automatically after 10 seconds from detection
                 // No need to schedule stop here
@@ -1272,13 +1365,13 @@ export default function App() {
               return prev
             })
             activeCellPhoneViolationRef.current = null
+            resetEventDetectionCount('cell_phone') // Reset detection count when violation ends
           }
 
           // Check for multiple faces
           if (faceCount > 1 && !currentDetection) {
             currentDetection = 'multiple_faces'
             latestDetectionScoreRef.current = { type: 'multiple_faces', score: faceCount }
-            console.log(`👥 Multiple faces detected: ${faceCount}`)
           } else if (faceCount <= 1 && activeMultipleFacesViolationRef.current !== null) {
             // End multiple faces violation (add 10 seconds after)
             setViolations(prev => {
@@ -1290,7 +1383,6 @@ export default function App() {
                   ...updated[activeIndex],
                   endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
                 }
-                console.log('✅ Multiple faces violation ended')
                 
                 // Violation recording stops automatically after 10 seconds from detection
                 // No need to schedule stop here
@@ -1300,6 +1392,7 @@ export default function App() {
               return prev
             })
             activeMultipleFacesViolationRef.current = null
+            resetEventDetectionCount('multiple_faces') // Reset detection count when violation ends
           }
 
           // Check for face not visible
@@ -1310,18 +1403,8 @@ export default function App() {
               currentDetection = 'face_not_visible'
               latestDetectionScoreRef.current = { type: 'face_not_visible', score: 0 }
               
-              if (faceNotVisibleCountRef.current === REQUIRED_CONSECUTIVE_FACE_MISSES) {
-                console.log(`⚠️ Face not visible condition met after ${faceNotVisibleCountRef.current} consecutive misses`)
-              }
-            } else {
-              if (faceNotVisibleCountRef.current % 10 === 0) { // Log every 10 frames
-                console.log(`👤 No face detected (${faceNotVisibleCountRef.current}/${REQUIRED_CONSECUTIVE_FACE_MISSES} frames)`)
-              }
             }
           } else if (faceCount > 0) {
-            if (faceNotVisibleCountRef.current > 0) {
-              console.log(`✅ Face detected, resetting face visibility counter (was at ${faceNotVisibleCountRef.current})`)
-            }
             faceNotVisibleCountRef.current = 0
             
             if (detectionCountRef.current.type === 'face_not_visible') {
@@ -1337,7 +1420,6 @@ export default function App() {
                       ...updated[activeIndex],
                       endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
                     }
-                    console.log('✅ Face not visible violation ended (face detected)')
                     
                     // Violation recording stops automatically after 10 seconds from detection
                     // No need to schedule stop here
@@ -1347,6 +1429,7 @@ export default function App() {
                   return prev
                 })
                 activeFaceNotVisibleViolationRef.current = null
+                resetEventDetectionCount('face_not_visible') // Reset detection count when violation ends
               }
             }
           }
@@ -1366,12 +1449,12 @@ export default function App() {
                     ...updated[activeIndex],
                     endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
                   }
-                  console.log('✅ Cell phone violation ended (detection type changed)')
                   return updated
                 }
                 return prev
               })
               activeCellPhoneViolationRef.current = null
+              resetEventDetectionCount('cell_phone') // Reset detection count when violation ends
             }
             
             if (detectionCountRef.current.type === 'multiple_faces' && activeMultipleFacesViolationRef.current !== null) {
@@ -1384,12 +1467,12 @@ export default function App() {
                     ...updated[activeIndex],
                     endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
                   }
-                  console.log('✅ Multiple faces violation ended (detection type changed)')
                   return updated
                 }
                 return prev
               })
               activeMultipleFacesViolationRef.current = null
+              resetEventDetectionCount('multiple_faces') // Reset detection count when violation ends
             }
             
             detectionCountRef.current.type = currentDetection
@@ -1413,76 +1496,47 @@ export default function App() {
             const timeSinceLastDetection = now - lastCellPhoneDetectionTimeRef.current
             shouldTriggerAlert = timeSinceLastDetection >= CELL_PHONE_DEBOUNCE_MS
             
-            if (!shouldTriggerAlert) {
-              console.log(`⏱️ Cell phone alert debounced (${(timeSinceLastDetection / 1000).toFixed(1)}s < ${(CELL_PHONE_DEBOUNCE_MS / 1000).toFixed(0)}s)`)
-            }
           }
           
           if (shouldTriggerAlert) {
-            console.log(`🚨🚨🚨 VIOLATION ALERT TRIGGERED: ${confirmedDetection}`)
-            console.log(`📊 Current state - isExamActive (state): ${isExamActive}, isExamActive (ref): ${isExamActiveRef.current}`)
             // Log violation
             if (confirmedDetection === 'cell_phone') {
-              console.log('⚠️ VIOLATION TRIGGERED: Cell Phone Detected!')
-              console.log(`📊 Exam active: ${isExamActive}, Media stream: ${!!mediaStreamRef.current}`)
-              
               // Start violation recording automatically (will be ignored if already recording this type)
               const streamToUse = getMediaStream()
               const examIsActive = isExamActiveRef.current || isExamActive // Check both ref and state
               
-              console.log(`🔍 Recording check - examActive (ref): ${isExamActiveRef.current}, examActive (state): ${isExamActive}, stream: ${!!streamToUse}`)
-              
               if (examIsActive && streamToUse) {
-                console.log('🎬 Attempting to start cell phone violation recording...')
                 const detectionTime = new Date()
                 // Fire and forget - violation recording runs in background
                 // startViolationRecording will ignore if same type is already recording
                 startViolationRecording(streamToUse, detectionTime, 'cell_phone').catch((error) => {
                   console.error('Error starting violation recording:', error)
                 })
-              } else {
-                console.error(`❌ CANNOT START RECORDING - exam active (ref): ${isExamActiveRef.current}, exam active (state): ${isExamActive}, stream: ${!!streamToUse}`)
               }
               lastCellPhoneDetectionTimeRef.current = Date.now()
             } else if (confirmedDetection === 'multiple_faces') {
-              console.log('⚠️ VIOLATION TRIGGERED: Multiple Faces Detected!')
-              console.log(`📊 Exam active: ${isExamActive}, Media stream: ${!!mediaStreamRef.current}`)
-              
               // Start violation recording automatically (will be ignored if already recording this type)
               const streamToUse = getMediaStream()
               const examIsActive = isExamActiveRef.current || isExamActive // Check both ref and state
               
-              console.log(`🔍 Recording check - examActive (ref): ${isExamActiveRef.current}, examActive (state): ${isExamActive}, stream: ${!!streamToUse}`)
-              
               if (examIsActive && streamToUse) {
-                console.log('🎬 Attempting to start multiple faces violation recording...')
                 const detectionTime = new Date()
                 // startViolationRecording will ignore if same type is already recording
                 startViolationRecording(streamToUse, detectionTime, 'multiple_faces').catch((error) => {
                   console.error('Error starting violation recording:', error)
                 })
-              } else {
-                console.error(`❌ CANNOT START RECORDING - exam active (ref): ${isExamActiveRef.current}, exam active (state): ${isExamActive}, stream: ${!!streamToUse}`)
               }
             } else if (confirmedDetection === 'face_not_visible') {
-              console.log('⚠️ VIOLATION TRIGGERED: Face Not Visible!')
-              console.log(`📊 Exam active: ${isExamActive}, Media stream: ${!!mediaStreamRef.current}`)
-              
               // Start violation recording automatically (will be ignored if already recording this type)
               const streamToUse = getMediaStream()
               const examIsActive = isExamActiveRef.current || isExamActive // Check both ref and state
               
-              console.log(`🔍 Recording check - examActive (ref): ${isExamActiveRef.current}, examActive (state): ${isExamActive}, stream: ${!!streamToUse}`)
-              
               if (examIsActive && streamToUse) {
-                console.log('🎬 Attempting to start face not visible violation recording...')
                 const detectionTime = new Date()
                 // startViolationRecording will ignore if same type is already recording
                 startViolationRecording(streamToUse, detectionTime, 'face_not_visible').catch((error) => {
                   console.error('Error starting violation recording:', error)
                 })
-              } else {
-                console.error(`❌ CANNOT START RECORDING - exam active (ref): ${isExamActiveRef.current}, exam active (state): ${isExamActive}, stream: ${!!streamToUse}`)
               }
             }
 
@@ -1558,8 +1612,6 @@ export default function App() {
     const handleVisibilityChange = () => {
       // Detect when user switches away from the tab (tab becomes hidden)
       if (document.hidden && isExamActiveRef.current) {
-        console.log('⚠️ Tab switch detected - user switched to another tab')
-        
         // Trigger tab switch violation
         const detectionTime = new Date()
         detectionCountRef.current = { type: 'tab_switch', count: 1 }
@@ -1571,7 +1623,6 @@ export default function App() {
         // Start violation recording if exam is active
         const streamToUse = getMediaStream()
         if (streamToUse) {
-          console.log('🎬 Starting tab switch violation recording...')
           startViolationRecording(streamToUse, detectionTime, 'tab_switch').catch((error) => {
             console.error('Error starting tab switch violation recording:', error)
           })
@@ -1587,13 +1638,13 @@ export default function App() {
               ...updated[activeIndex],
               endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after tab becomes visible
             }
-            console.log('✅ Tab switch violation ended (tab visible again)')
             return updated
           }
           return prev
         })
         activeTabSwitchViolationRef.current = null
         detectionCountRef.current = { type: null, count: 0 }
+        resetEventDetectionCount('tab_switch') // Reset detection count when violation ends
       }
     }
 
@@ -1621,11 +1672,13 @@ export default function App() {
 
   // Log detection history changes (for debugging/maintenance)
   useEffect(() => {
-    if (detectionHistory.length > 0) {
-      const latest = detectionHistory[detectionHistory.length - 1]
-      console.log(`📊 Detection history: ${detectionHistory.length} entries (latest: ${latest.type} at ${latest.timestamp.toISOString()})`)
-    }
+    // Removed console.log statements
   }, [detectionHistory])
+
+  // Extract session ID from URL parameters on mount
+  useEffect(() => {
+    extractSessionId()
+  }, [extractSessionId])
 
   useEffect(() => {
     loadMediaPipeModels()
@@ -1698,6 +1751,10 @@ export default function App() {
         examChunkRecorderRef.current = null
       }
       
+      // Clear detection counts on unmount
+      eventDetectionCountRef.current.clear()
+      eventFirstDetectionRef.current.clear()
+      
       // Stop all media stream tracks
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach(track => track.stop())
@@ -1740,6 +1797,11 @@ export default function App() {
           >
             {isExamActive ? 'TAMAT PEPERIKSAAN' : 'MULA PEPERIKSAAN'}
           </Button>
+          {sessionIdDisplay && (
+            <div className="text-xs text-gray-600 bg-gray-100 px-3 py-1.5 rounded-md border border-gray-300">
+              <span className="font-semibold text-gray-700">Session ID:</span> {sessionIdDisplay}
+            </div>
+          )}
           <Button
             onClick={() => setIsViewVisible(!isViewVisible)}
             variant="ghost"
