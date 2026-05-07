@@ -192,6 +192,9 @@ export default function App() {
     }
   }, [recordedVideos])
 
+  // Auto-start flag — ensures exam starts only once when both webcam and models are ready
+  const hasAutoStartedRef = useRef(false)
+
   // eKYC state
   // const [eKYCCompleted, setEKYCCompleted] = useState(false)
 
@@ -1689,6 +1692,25 @@ export default function App() {
     // Removed console.log statements
   }, [detectionHistory])
 
+  // Auto-start exam when webcam and models are both ready
+  useEffect(() => {
+    if (webcamReady && modelsLoaded && !hasAutoStartedRef.current) {
+      hasAutoStartedRef.current = true
+      handleStartExam()
+    }
+  }, [webcamReady, modelsLoaded, handleStartExam])
+
+  // Auto-end exam when tab/window is closed (embedded scenario)
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (isExamActiveRef.current) {
+        handleEndExam()
+      }
+    }
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload)
+  }, [handleEndExam])
+
   // Extract session ID from URL parameters on mount
   useEffect(() => {
     extractSessionId()
@@ -1803,6 +1825,7 @@ export default function App() {
           <Button
             onClick={isExamActive ? handleEndExam : handleStartExam}
             disabled={!webcamReady || !modelsLoaded}
+            style={{ display: 'none' }}
             className={`font-semibold px-8 py-3 ${
               isExamActive
                 ? 'bg-red-600 hover:bg-red-700 text-white'
