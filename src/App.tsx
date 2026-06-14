@@ -10,6 +10,7 @@ import { toBlobURL } from '@ffmpeg/util'
 import { fixWebmMetadata } from '@/lib/utils'
 import { Eye, EyeOff, Layers, Square } from 'lucide-react'
 import axios from 'axios'
+import { useFaceProctoring } from '@/proctoring/useFaceProctoring'
 // import EKYC from '@/components/EKYC'
 
 type DetectionType = 'cell_phone' | 'multiple_faces' | 'face_not_visible' | 'tab_switch' | null
@@ -76,6 +77,9 @@ export default function App() {
   // Session ID from URL parameters
   const sessionIdRef = useRef<string | null>(null)
   const [sessionIdDisplay, setSessionIdDisplay] = useState<string | null>(null)
+
+  // Parameters for the wrong-face proctoring feature (read from the URL on mount)
+  const [proctorSessionId, setProctorSessionId] = useState<string | null>(null)
   
   // User ID from URL parameters
   const userIdRef = useRef<string | null>(null)
@@ -205,16 +209,17 @@ export default function App() {
   const extractSessionId = useCallback(() => {
     const urlParams = new URLSearchParams(window.location.search)
     const idNo = urlParams.get('idNo')
+    const sessionIdParam = urlParams.get('sessionId') // Prefer explicit sessionId param
     const userId = urlParams.get('userId') || idNo // Use userId param if available, otherwise use idNo
-    
-    if (idNo) {
-      const sessionId = idNo
+    const sessionId = sessionIdParam || idNo // Fall back to idNo when sessionId is absent
+
+    if (sessionId) {
       sessionIdRef.current = sessionId
       setSessionIdDisplay(sessionId)
       userIdRef.current = userId || sessionId // Use userId if provided, otherwise use sessionId
       return sessionId
     } else {
-      console.warn('⚠️ Missing URL parameter: idNo not found')
+      console.warn('⚠️ Missing URL parameter: neither sessionId nor idNo found')
       // Set session ID to null when parameter is missing
       sessionIdRef.current = null
       setSessionIdDisplay(null)
@@ -1713,8 +1718,14 @@ export default function App() {
 
   // Extract session ID from URL parameters on mount
   useEffect(() => {
-    extractSessionId()
+    const sid = extractSessionId()
+    setProctorSessionId(sid)
   }, [extractSessionId])
+
+  // Wrong-face proctoring: compares the live webcam feed against the KYC selfie.
+  const faceProctoring = useFaceProctoring({ sessionId: proctorSessionId })
+  const showFaceMismatchBanner =
+    faceProctoring.incidentState === 'DETECTED' || faceProctoring.incidentState === 'PERSISTING'
 
   useEffect(() => {
     loadMediaPipeModels()
@@ -1812,6 +1823,12 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 p-4">
+      {/* Non-blocking face-mismatch warning banner (auto-hides when state returns to CLEAR) */}
+      {showFaceMismatchBanner && (
+        <div className="fixed top-0 left-0 right-0 z-50 bg-red-600 text-white text-center font-semibold px-4 py-3 shadow-md">
+          Face mismatch detected — please face the camera
+        </div>
+      )}
       <div className="max-w-7xl mx-auto space-y-4">
         {/* Header */}
         <div className="text-center">
@@ -1867,6 +1884,7 @@ export default function App() {
                   <>
                     <Webcam
                       ref={webcamRef}
+                      id="proctoring-video"
                       audio={false}
                       videoConstraints={{
                         width: { ideal: 854, max: 854 },
