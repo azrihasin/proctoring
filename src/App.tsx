@@ -5,15 +5,13 @@ import { useReactMediaRecorder } from 'react-media-recorder'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Textarea } from '@/components/ui/textarea'
-import { FFmpeg } from '@ffmpeg/ffmpeg'
-import { toBlobURL } from '@ffmpeg/util'
 import { fixWebmMetadata } from '@/lib/utils'
 import { Eye, EyeOff, Layers, Square } from 'lucide-react'
 import axios from 'axios'
 import { useFaceProctoring } from '@/proctoring/useFaceProctoring'
 // import EKYC from '@/components/EKYC'
 
-type DetectionType = 'cell_phone' | 'multiple_faces' | 'face_not_visible' | 'tab_switch' | null
+type DetectionType = 'cell_phone' | 'multiple_faces' | 'face_not_visible' | 'tab_switch' | 'wrong_face' | null
 
 type DetectionHistoryEntry = {
   type: DetectionType
@@ -36,6 +34,12 @@ type SavedVideo = {
   ext: 'mp4' | 'webm'
   converted: boolean
 }
+
+// Minimum gap between event-API sends / video uploads for the SAME violation
+// type. A violation re-fires on every detection frame (~10x/sec) for as long as
+// it is visible, so without this we would hit /event and /upload continuously.
+// One event + one 10s clip per type per window is plenty for review.
+const VIOLATION_COOLDOWN_MS = 30000 // 30 seconds
 
 type RecordedVideo = {
   id: string
@@ -73,6 +77,7 @@ export default function App() {
   const activeCellPhoneViolationRef = useRef<number | null>(null) // Index of active cell_phone violation in violations array
   const activeMultipleFacesViolationRef = useRef<number | null>(null) // Index of active multiple_faces violation in violations array
   const activeTabSwitchViolationRef = useRef<number | null>(null) // Index of active tab_switch violation in violations array
+  const activeWrongFaceViolationRef = useRef<number | null>(null) // Index of active wrong_face violation in violations array
   
   // Session ID from URL parameters
   const sessionIdRef = useRef<string | null>(null)
@@ -80,6 +85,9 @@ export default function App() {
 
   // Parameters for the wrong-face proctoring feature (read from the URL on mount)
   const [proctorSessionId, setProctorSessionId] = useState<string | null>(null)
+  // Live, human-readable status of the wrong-face checker (shown on-screen so the
+  // failure point is visible without opening the browser console).
+  const [faceProctoringStatus, setFaceProctoringStatus] = useState<string>('Wrong-face check: initializing…')
   
   // User ID from URL parameters
   const userIdRef = useRef<string | null>(null)
@@ -87,9 +95,10 @@ export default function App() {
   // Track last log time per log message type for throttling
   const lastLogTimeRef = useRef<Map<string, number>>(new Map())
   
-  // Track consecutive detection counts per event type for API sending
-  const eventDetectionCountRef = useRef<Map<string, number>>(new Map()) // eventType -> count
-  const eventFirstDetectionRef = useRef<Map<string, boolean>>(new Map()) // eventType -> isFirstDetection
+  // Cooldown bookkeeping — see VIOLATION_COOLDOWN_MS. These cap how often a
+  // given violation type may hit the event endpoint and upload a video clip.
+  const lastEventSentRef = useRef<Map<string, number>>(new Map()) // eventType -> last /event send time
+  const lastVideoUploadRef = useRef<Map<DetectionType, number>>(new Map()) // type -> last clip recording start time
   
   // Exam recording state
   const [isExamActive, setIsExamActive] = useState(false)
@@ -172,7 +181,7 @@ export default function App() {
   
   // Recorded videos list
   const [recordedVideos, setRecordedVideos] = useState<RecordedVideo[]>([])
-  
+
   // Refs for auto-scrolling
   const logSectionRef = useRef<HTMLTextAreaElement>(null)
   const recordingListRef = useRef<HTMLDivElement>(null)
@@ -201,9 +210,6 @@ export default function App() {
 
   // eKYC state
   // const [eKYCCompleted, setEKYCCompleted] = useState(false)
-
-  // FFmpeg instance for video conversion
-  const ffmpegRef = useRef<FFmpeg | null>(null)
 
   // Extract URL parameters and create session ID
   const extractSessionId = useCallback(() => {
@@ -264,27 +270,6 @@ export default function App() {
     return null
   }, [])
 
-  // Initialize FFmpeg
-  useEffect(() => {
-    const loadFFmpeg = async () => {
-      try {
-        const ffmpeg = new FFmpeg()
-        ffmpegRef.current = ffmpeg
-
-        const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm'
-        await ffmpeg.load({
-          coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-          wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-        })
-
-      } catch (error) {
-        console.error('Error loading FFmpeg:', error)
-      }
-    }
-
-    loadFFmpeg()
-  }, [])
-
   // Save video in original format (no conversion)
   const saveVideo = useCallback(async (webmBlob: Blob): Promise<SavedVideo> => {
     // Fix WebM metadata to preserve duration
@@ -330,16 +315,9 @@ export default function App() {
     try {
       // Format timestamp as ISO string without milliseconds (e.g., "2018-12-30T19:34:50")
       const timestampStr = timestamp.toISOString().slice(0, 19)
-      
-      // Convert sessionId to number (parse as integer)
-      const sessionIdNum = parseInt(sessionIdRef.current, 10)
-      if (isNaN(sessionIdNum)) {
-        console.warn('⚠️ Session ID is not a valid number, skipping API call')
-        return
-      }
-      
+
       const body = {
-        sessionId: sessionIdNum,
+        sessionId: sessionIdRef.current, // UUID string — do not coerce to number
         timestamp: timestampStr,
         eventType: eventType
       }
@@ -379,6 +357,8 @@ export default function App() {
       return 'multiple-faces'
     } else if (messageLower.includes('tab switch') || messageLower.includes('tab-switch')) {
       return 'tab-switch'
+    } else if (messageLower.includes('face mismatch') || messageLower.includes('wrong face')) {
+      return 'face-mismatch'
     }
     return null
   }, [])
@@ -393,17 +373,21 @@ export default function App() {
       return 'multiple-faces'
     } else if (detectionType === 'tab_switch') {
       return 'tab-switch'
+    } else if (detectionType === 'wrong_face') {
+      return 'face-mismatch'
     }
     return null
   }, [])
 
-  // Reset detection count for an event type when violation ends
+  // Clear the cooldown windows when a violation ends, so that a genuinely NEW
+  // occurrence of the same type later is treated fresh (event + clip sent again)
+  // instead of being suppressed by a stale cooldown timestamp.
   const resetEventDetectionCount = useCallback((detectionType: DetectionType) => {
     const eventType = getEventTypeFromDetectionType(detectionType)
     if (eventType) {
-      eventDetectionCountRef.current.set(eventType, 0)
-      eventFirstDetectionRef.current.set(eventType, true) // Reset to allow first detection again
+      lastEventSentRef.current.delete(eventType)
     }
+    lastVideoUploadRef.current.delete(detectionType)
   }, [getEventTypeFromDetectionType])
 
   // Add log entry helper with throttling for repeating logs
@@ -412,22 +396,25 @@ export default function App() {
     if (!isExamActiveRef.current) {
       return
     }
-    
+
+    const eventType = getEventTypeFromMessage(message)
+
+    // Throttle the visible log by a STABLE key. Some messages embed changing
+    // text (e.g. the cell-phone confidence "%"), which would otherwise produce a
+    // different key every frame and defeat throttling entirely — so for known
+    // violation types we key by the eventType, not the raw message.
+    const throttleKey = eventType || message
+
     const now = Date.now()
-    const lastLogTime = lastLogTimeRef.current.get(message) || 0
-    const timeSinceLastLog = now - lastLogTime
-    const THROTTLE_INTERVAL_MS = 10000 // 10 seconds
-    
+    const lastLogTime = lastLogTimeRef.current.get(throttleKey) || 0
+    const LOG_THROTTLE_INTERVAL_MS = 10000 // 10 seconds between repeated log lines
+
     // For repeating logs, only show if 10 seconds have passed since last occurrence
-    if (timeSinceLastLog < THROTTLE_INTERVAL_MS && lastLogTime > 0) {
-      // Skip this log entry - it's a repeat within 10 seconds
-      // Don't increment API count or send API events for skipped logs
+    if (lastLogTime > 0 && now - lastLogTime < LOG_THROTTLE_INTERVAL_MS) {
       return
     }
-    
-    // Update last log time for this message
-    lastLogTimeRef.current.set(message, now)
-    
+    lastLogTimeRef.current.set(throttleKey, now)
+
     const timestamp = new Date().toLocaleString('en-US', {
       month: '2-digit',
       day: '2-digit',
@@ -439,35 +426,18 @@ export default function App() {
     })
     const logMessage = `${timestamp} ${message}`
     setLogEntries(prev => [...prev.slice(-99), logMessage]) // Keep last 100 entries
-    
-    // Handle API sending based on consecutive log entries that actually appear in the log section
-    // Only track and send API events for logs that pass the throttling check above
-    const eventType = getEventTypeFromMessage(message)
+
+    // Send the violation event to the API at most once per cooldown window per
+    // event type. (The matching video clip is uploaded on the same cooldown,
+    // gated separately inside startViolationRecording.)
     if (eventType) {
-      const currentCount = eventDetectionCountRef.current.get(eventType) || 0
-      const isFirstDetection = eventFirstDetectionRef.current.get(eventType) !== false
-      
-      // Increment count only for logs that actually appear in the log section
-      const newCount = currentCount + 1
-      eventDetectionCountRef.current.set(eventType, newCount)
-      
-      // Send to API only on first log entry or every 10th consecutive log entry of same type
-      // For consecutive log entries (2nd-9th), don't send - only send 1 log total for those entries
-      if (isFirstDetection) {
-        // First log entry of this event type - send immediately
-        eventFirstDetectionRef.current.set(eventType, false)
-        sendLogToAPI(eventType, new Date()).catch((error) => {
-          console.error('Error sending log to API:', error)
-        })
-      } else if (newCount === 10) {
-        // Exactly 10th consecutive log entry - send to API and reset count to start cycle again
-        eventDetectionCountRef.current.set(eventType, 0) // Reset to 0
-        eventFirstDetectionRef.current.set(eventType, true) // Mark as first again for next cycle
+      const lastEventSent = lastEventSentRef.current.get(eventType) || 0
+      if (now - lastEventSent >= VIOLATION_COOLDOWN_MS) {
+        lastEventSentRef.current.set(eventType, now)
         sendLogToAPI(eventType, new Date()).catch((error) => {
           console.error('Error sending log to API:', error)
         })
       }
-      // For counts 2-9, don't send anything - only 1 log was sent on first log entry
     }
   }, [getEventTypeFromMessage, sendLogToAPI])
 
@@ -542,12 +512,14 @@ export default function App() {
     }
   }, [])
 
-  // Add recorded video to list
-  const addRecordedVideo = useCallback((savedVideo: SavedVideo, filename: string, type: 'exam' | 'violation') => {
+  // Add recorded video to list. Returns the generated id so callers can update
+  // the entry later (e.g. swap in the transcoded MP4 once it's ready).
+  const addRecordedVideo = useCallback((savedVideo: SavedVideo, filename: string, type: 'exam' | 'violation'): string => {
     // Store the blob directly - React state will keep it in memory
     // The blob should remain valid as long as it's in state
+    const id = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
     const recordedVideo: RecordedVideo = {
-      id: `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      id,
       filename,
       blob: savedVideo.blob, // Store blob directly
       mime: savedVideo.mime,
@@ -558,11 +530,9 @@ export default function App() {
       size: savedVideo.blob.size,
       mp4Blob: savedVideo.converted && savedVideo.ext === 'mp4' ? savedVideo.blob : undefined,
     }
-    
-    setRecordedVideos(prev => {
-      const newList = [...prev, recordedVideo]
-      return newList
-    })
+
+    setRecordedVideos(prev => [...prev, recordedVideo])
+    return id
   }, [])
 
   // MediaRecorder for chunk access (needed for periodic saving)
@@ -603,6 +573,7 @@ export default function App() {
       activeCellPhoneViolationRef.current = null // Reset active cell_phone violation
       activeMultipleFacesViolationRef.current = null // Reset active multiple_faces violation
       activeTabSwitchViolationRef.current = null // Reset active tab_switch violation
+      activeWrongFaceViolationRef.current = null // Reset active wrong_face violation
       examVideoChunksRef.current = []
       lastSavedSegmentTimeRef.current = Date.now()
 
@@ -619,9 +590,9 @@ export default function App() {
         setRecordingDuration(elapsed)
       }, 1000)
 
-      // Reset detection counts and first detection flags when exam starts
-      eventDetectionCountRef.current.clear()
-      eventFirstDetectionRef.current.clear()
+      // Reset per-type cooldown windows when exam starts
+      lastEventSentRef.current.clear()
+      lastVideoUploadRef.current.clear()
 
       // NO exam video segments - NO periodic recording
     } catch (error) {
@@ -662,43 +633,25 @@ export default function App() {
     })
   }, [])
 
-  // Simple synchronous download helper - must be called directly from user click
+  // Download the recorded clip as-is (WebM). We no longer transcode to MP4 —
+  // the clip is downloaded exactly as it was recorded and uploaded.
   const downloadVideo = useCallback((video: RecordedVideo) => {
     try {
-      if (!video.blob) {
-        console.error('Video blob is null or undefined')
+      if (!video.blob || video.blob.size === 0) {
+        console.error('Video blob is null or empty')
         return
       }
 
-      if (video.blob.size === 0) {
-        console.error('Video blob is empty')
-        return
-      }
-
-      // Use the blob directly in its original format
-      const blobToDownload = video.blob
-      const filename = video.filename
-
-      // Validate blob duration (async, but don't block download)
-      validateBlobDuration(blobToDownload).then(({ duration, isValid }) => {
-        if (!isValid) {
-          console.warn(`⚠️ Blob may have duration/scrubbing issues (duration: ${duration})`)
-        }
-      }).catch(err => {
-        console.warn('Blob validation error:', err)
-      })
-
-      // Create download link synchronously
-      const url = URL.createObjectURL(blobToDownload)
+      const url = URL.createObjectURL(video.blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = filename
+      a.download = video.filename
       a.style.display = 'none'
       document.body.appendChild(a)
-      
+
       // Trigger download
       a.click()
-      
+
       // Clean up after a short delay
       setTimeout(() => {
         document.body.removeChild(a)
@@ -707,7 +660,7 @@ export default function App() {
     } catch (error) {
       console.error('Error downloading video:', error)
     }
-  }, [addLogEntry, validateBlobDuration])
+  }, [])
 
   // End exam and save final video
   const handleEndExam = useCallback(async () => {
@@ -767,10 +720,10 @@ export default function App() {
       // Don't stop exam recording - we're not recording the exam anymore
       // stopExamRecording() // Disabled - only recording violations
       
-      // Reset detection counts when exam ends
-      eventDetectionCountRef.current.clear()
-      eventFirstDetectionRef.current.clear()
-      
+      // Reset per-type cooldown windows when exam ends
+      lastEventSentRef.current.clear()
+      lastVideoUploadRef.current.clear()
+
       // No final exam video to save - only violation recordings are saved
 
         setIsExamActive(false)
@@ -795,7 +748,15 @@ export default function App() {
     if (activeRecordingByTypeRef.current.get(violationType) === true) {
       return
     }
-    
+
+    // Cooldown: a violation fires on every detection frame while it persists, so
+    // don't start (and later upload) a fresh clip if we already recorded one for
+    // this type within the cooldown window. Caps uploads at one clip per window.
+    const lastUpload = lastVideoUploadRef.current.get(violationType) || 0
+    if (Date.now() - lastUpload < VIOLATION_COOLDOWN_MS) {
+      return
+    }
+
     // Validate stream
     if (!stream || !stream.active) {
       console.error('❌ Stream is not active or invalid')
@@ -815,9 +776,11 @@ export default function App() {
       return
     }
     
-    // Mark this violation type as being recorded
+    // Mark this violation type as being recorded and open the cooldown window
+    // now (at recording start) so concurrent frames don't queue more clips.
     activeRecordingByTypeRef.current.set(violationType, true)
-    
+    lastVideoUploadRef.current.set(violationType, Date.now())
+
     // Initialize chunks array for this violation type
     violationChunksByTypeRef.current.set(violationType, [])
     violationDetectionTimesRef.current.set(violationType, detectionTime)
@@ -897,53 +860,53 @@ export default function App() {
             return
           }
           
-          // Fix metadata
+          // Fix WebM metadata (duration) so the clip is seekable/playable
           const fixedBlob = await fixWebmMetadata(blob)
-          
-          const ext = currentMimeType.includes('webm') ? 'webm' : 'mp4'
-          const result: SavedVideo = { 
-            blob: fixedBlob, 
-            mime: currentMimeType, 
-            ext: ext as 'mp4' | 'webm', 
-            converted: false 
-          }
-          
+
+          const baseExt: 'mp4' | 'webm' = currentMimeType.includes('webm') ? 'webm' : 'mp4'
           const timestamp = detectionTime.toISOString().replace(/[:.]/g, '-').slice(0, -5)
           const violationTypeStr = currentViolationType === 'cell_phone' ? 'cell_phone_detection' :
                                    currentViolationType === 'multiple_faces' ? 'multiple_faces_detection' :
                                    currentViolationType === 'face_not_visible' ? 'face_not_visible_detection' :
                                    currentViolationType === 'tab_switch' ? 'tab_switch_detection' :
+                                   currentViolationType === 'wrong_face' ? 'wrong_face_detection' :
                                    'violation'
-          const filename = `${violationTypeStr}_${timestamp}.${result.ext}`
+          const baseFilename = `${violationTypeStr}_${timestamp}`
 
-          // Add to recorded videos list immediately
-          addRecordedVideo(result, filename, 'violation')
-          
+          // Add the clip (WebM) to the recorded list so it shows up right away.
+          addRecordedVideo(
+            { blob: fixedBlob, mime: currentMimeType, ext: baseExt, converted: false },
+            `${baseFilename}.${baseExt}`,
+            'violation'
+          )
+
           // Map violation type to eventType format
           const eventTypeMap: Record<string, string> = {
             'cell_phone': 'phone',
             'face_not_visible': 'face-not-visible',
             'multiple_faces': 'multiple-faces',
-            'tab_switch': 'tab-switch'
+            'tab_switch': 'tab-switch',
+            'wrong_face': 'face-mismatch'
           }
           const eventType = eventTypeMap[currentViolationType] || currentViolationType || 'unknown'
-          
-          // Calculate startTime and endTime for the recording
+
           // Recording starts at detectionTime and stops after 10 seconds
           const startTime = detectionTime
-          const endTime = new Date(detectionTime.getTime() + 10000) // 10 seconds after detection
-          
-          // Send video to API
-          sendVideoToAPI(fixedBlob, eventType, startTime, endTime).catch((error) => {
-            console.error('Error sending video to API:', error)
-          })
-          
-          // Clear refs and recording flag for this violation type
+          const endTime = new Date(detectionTime.getTime() + 10000)
+
+          // Clear refs and recording flag for this violation type now that the
+          // clip is captured — background transcode/upload below is independent.
           activeRecordingByTypeRef.current.set(currentViolationType, false)
           violationRecordersRef.current.delete(currentViolationType)
           violationChunksByTypeRef.current.delete(currentViolationType)
           violationDetectionTimesRef.current.delete(currentViolationType)
           violationTimeoutsRef.current.delete(currentViolationType)
+
+          // Upload the recorded clip as WebM (no MP4 transcode). The clip is
+          // stored and uploaded exactly as MediaRecorder produced it.
+          void sendVideoToAPI(fixedBlob, eventType, startTime, endTime).catch((error) => {
+            console.error('Error sending video to API:', error)
+          })
         } catch (error) {
           console.error(`❌❌❌ ERROR in onstop processing for ${currentViolationType}:`, error)
           // Clear recording flag even on error
@@ -1011,15 +974,17 @@ export default function App() {
   // Add violation to list when detected
   const addViolation = useCallback((type: DetectionType, score?: number) => {
     // For face_not_visible, cell_phone, multiple_faces, and tab_switch, track as duration - update existing or create new
-    if (type === 'face_not_visible' || type === 'cell_phone' || type === 'multiple_faces' || type === 'tab_switch') {
+    if (type === 'face_not_visible' || type === 'cell_phone' || type === 'multiple_faces' || type === 'tab_switch' || type === 'wrong_face') {
       setViolations(prev => {
-        const activeRef = type === 'face_not_visible' 
-          ? activeFaceNotVisibleViolationRef 
+        const activeRef = type === 'face_not_visible'
+          ? activeFaceNotVisibleViolationRef
           : type === 'cell_phone'
           ? activeCellPhoneViolationRef
           : type === 'multiple_faces'
           ? activeMultipleFacesViolationRef
-          : activeTabSwitchViolationRef
+          : type === 'tab_switch'
+          ? activeTabSwitchViolationRef
+          : activeWrongFaceViolationRef
         
         // Check if there's an active violation of this type
         if (activeRef.current !== null) {
@@ -1068,6 +1033,8 @@ export default function App() {
           ? 'Multiple Faces Detected'
           : type === 'tab_switch'
           ? 'Tab Switch Detected'
+          : type === 'wrong_face'
+          ? 'Face Mismatch Detected'
           : 'Violation Detected'
         addLogEntry(violationMessage)
         
@@ -1723,9 +1690,51 @@ export default function App() {
   }, [extractSessionId])
 
   // Wrong-face proctoring: compares the live webcam feed against the KYC selfie.
-  const faceProctoring = useFaceProctoring({ sessionId: proctorSessionId })
-  const showFaceMismatchBanner =
-    faceProctoring.incidentState === 'DETECTED' || faceProctoring.incidentState === 'PERSISTING'
+  // Mismatches are routed through the exact same violation pipeline as every
+  // other violation type — logged, recorded (10s clip), and uploaded/event-sent.
+  const handleWrongFaceMismatch = useCallback((distance: number) => {
+    // Only act while an exam is in progress (mirrors the other detections).
+    if (!isExamActiveRef.current) return
+
+    // Start the 10-second violation recording (deduped per type while active).
+    const streamToUse = getMediaStream()
+    if (streamToUse) {
+      const detectionTime = new Date()
+      startViolationRecording(streamToUse, detectionTime, 'wrong_face').catch((error) => {
+        console.error('Error starting wrong face violation recording:', error)
+      })
+    }
+
+    // Log + send event (addViolation throttles repeats and updates duration).
+    addViolation('wrong_face', distance)
+  }, [getMediaStream, startViolationRecording, addViolation])
+
+  const handleWrongFaceMatch = useCallback(() => {
+    if (activeWrongFaceViolationRef.current === null) return
+    // Face matches again — close out the active violation (+10s like the others).
+    setViolations(prev => {
+      const activeIndex = activeWrongFaceViolationRef.current
+      if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'wrong_face') {
+        const updated = [...prev]
+        const currentTime = new Date()
+        updated[activeIndex] = {
+          ...updated[activeIndex],
+          endTime: new Date(currentTime.getTime() + 10000), // +10 seconds after match resumes
+        }
+        return updated
+      }
+      return prev
+    })
+    activeWrongFaceViolationRef.current = null
+    resetEventDetectionCount('wrong_face')
+  }, [resetEventDetectionCount])
+
+  useFaceProctoring({
+    sessionId: proctorSessionId,
+    onMismatch: handleWrongFaceMismatch,
+    onMatch: handleWrongFaceMatch,
+    onStatus: setFaceProctoringStatus,
+  })
 
   useEffect(() => {
     loadMediaPipeModels()
@@ -1798,9 +1807,9 @@ export default function App() {
         examChunkRecorderRef.current = null
       }
       
-      // Clear detection counts on unmount
-      eventDetectionCountRef.current.clear()
-      eventFirstDetectionRef.current.clear()
+      // Clear cooldown windows on unmount
+      lastEventSentRef.current.clear()
+      lastVideoUploadRef.current.clear()
       
       // Stop all media stream tracks
       if (mediaStreamRef.current) {
@@ -1823,12 +1832,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 p-4">
-      {/* Non-blocking face-mismatch warning banner (auto-hides when state returns to CLEAR) */}
-      {showFaceMismatchBanner && (
-        <div className="fixed top-0 left-0 right-0 z-50 bg-red-600 text-white text-center font-semibold px-4 py-3 shadow-md">
-          Face mismatch detected — please face the camera
-        </div>
-      )}
       <div className="max-w-7xl mx-auto space-y-4">
         {/* Header */}
         <div className="text-center">
@@ -1923,6 +1926,18 @@ export default function App() {
                   <h2 className="text-lg font-bold text-gray-900">Log Section</h2>
                   <div className="text-xs text-gray-600 bg-gray-100 px-3 py-1.5 rounded-md border border-gray-300">
                     <span className="font-semibold text-gray-700">Session ID:</span> {sessionIdDisplay || 'No Session ID'}
+                  </div>
+                  <div
+                    className={`text-xs px-3 py-1.5 rounded-md border ${
+                      faceProctoringStatus.includes('DISABLED') || faceProctoringStatus.includes('FAILED')
+                        ? 'text-red-700 bg-red-50 border-red-300'
+                        : faceProctoringStatus.includes('mismatch')
+                        ? 'text-orange-700 bg-orange-50 border-orange-300'
+                        : 'text-gray-600 bg-gray-100 border-gray-300'
+                    }`}
+                    title="Live status of the wrong-face (KYC mismatch) checker"
+                  >
+                    {faceProctoringStatus}
                   </div>
                 </div>
                 <Button

@@ -1,32 +1,34 @@
 import { useEffect, useRef } from 'react'
 import * as faceapi from '@vladmandic/face-api'
-import { useProctoringStore } from './proctoringStore'
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 const MODEL_URL = '/models'
 const KYC_URL = 'https://proctor-x-api.appricode.net/api/kyc/getPhoto'
-const UPLOAD_URL = 'https://proctor-x-api.appricode.net/api/proctor/upload'
-const EVENT_URL = 'https://proctor-x-api.appricode.net/api/proctor/event'
 const VIDEO_ELEMENT_ID = 'proctoring-video'
 
-const SIMILARITY_THRESHOLD = 0.7 // below => mismatch
-const GRACE_OPEN_COUNT = 5 // consecutive scores below threshold required to open
-const RESOLVE_COUNT = 3 // consecutive scores at/above threshold required to resolve
+// face-api descriptors are compared with Euclidean distance (the metric
+// FaceMatcher uses). Smaller distance = more similar. Same person is typically
+// < 0.5, a different person is typically > 0.6. Cosine similarity is NOT a
+// reliable metric here because the descriptors are not normalized — different
+// people routinely score 0.85–0.95, so a mismatch would never be flagged.
+const DISTANCE_THRESHOLD = 0.6 // above => mismatch
+const GRACE_OPEN_COUNT = 5 // consecutive mismatching ticks required to open
+const RESOLVE_COUNT = 3 // consecutive matching ticks required to resolve
 const TICK_INTERVAL_MS = 1000 // run a comparison every 1 second
-const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000 // at most one heartbeat every 5 minutes
 
 export interface FaceProctoringParams {
   sessionId: string | null
-}
-
-interface ActiveIncident {
-  incidentId: string
-  startedAt: string // ISO timestamp captured at open
-  startedAtMs: number
-  lastHeartbeatAt: number // epoch ms of last heartbeat (init = open time)
-  scoreAtDetection: number
+  // Called on every tick while the live face does not match the KYC selfie.
+  // `distance` is the Euclidean distance at detection time (higher = less similar).
+  onMismatch: (distance: number) => void
+  // Called once when the live face matches again (incident resolved).
+  onMatch: () => void
+  // Optional: surfaces a human-readable status of the wrong-face checker
+  // (disabled / KYC failure / active + live distance) so the host can show it
+  // on-screen for debugging without opening the browser console.
+  onStatus?: (message: string) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -57,17 +59,15 @@ async function extractDescriptor(
   return result ? result.descriptor : null
 }
 
-function cosineSimilarity(a: Float32Array, b: Float32Array): number {
-  let dot = 0
-  let normA = 0
-  let normB = 0
+function euclideanDistance(a: Float32Array, b: Float32Array): number {
+  // Mirrors faceapi.euclideanDistance — the metric face descriptors are
+  // designed for. Lower = more similar.
+  let sum = 0
   for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i]
-    normA += a[i] * a[i]
-    normB += b[i] * b[i]
+    const diff = a[i] - b[i]
+    sum += diff * diff
   }
-  if (normA === 0 || normB === 0) return 0
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB))
+  return Math.sqrt(sum)
 }
 
 // ---------------------------------------------------------------------------
@@ -117,78 +117,40 @@ async function fetchKycDescriptor(sessionId: string): Promise<Float32Array | nul
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot + API senders
-// ---------------------------------------------------------------------------
-function captureSnapshot(video: HTMLVideoElement): Promise<Blob | null> {
-  return new Promise((resolve) => {
-    const canvas = document.createElement('canvas')
-    canvas.width = video.videoWidth
-    canvas.height = video.videoHeight
-    const ctx = canvas.getContext('2d')
-    if (!ctx) {
-      resolve(null)
-      return
-    }
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-    canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.9)
-  })
-}
-
-async function sendUpload(
-  data: Record<string, unknown>,
-  blob: Blob,
-  filename: string,
-): Promise<void> {
-  const formData = new FormData()
-  formData.append('data', new Blob([JSON.stringify(data)], { type: 'application/json' }))
-  formData.append('file', blob, filename)
-  const res = await fetch(UPLOAD_URL, { method: 'POST', body: formData })
-  if (!res.ok) {
-    throw new Error(`proctor/upload failed: ${res.status} ${res.statusText}`)
-  }
-}
-
-async function sendEvent(body: Record<string, unknown>): Promise<void> {
-  const res = await fetch(EVENT_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  if (!res.ok) {
-    throw new Error(`proctor/event failed: ${res.status} ${res.statusText}`)
-  }
-}
-
-function makeIncidentId(): string {
-  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
-    return crypto.randomUUID()
-  }
-  return `inc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
-}
-
-// ---------------------------------------------------------------------------
 // Hook
+//
+// Compares the live webcam feed against the KYC selfie once a second. It does
+// NOT send any events or uploads itself — instead it reports mismatches through
+// the onMismatch / onMatch callbacks so the host can funnel them through the
+// same violation-log / event / upload pipeline as every other violation type.
 // ---------------------------------------------------------------------------
-export function useFaceProctoring({ sessionId }: FaceProctoringParams) {
+export function useFaceProctoring({ sessionId, onMismatch, onMatch, onStatus }: FaceProctoringParams) {
   // State-machine bookkeeping that must survive across interval ticks.
   const kycDescriptorRef = useRef<Float32Array | null>(null)
-  const incidentRef = useRef<ActiveIncident | null>(null)
-  const belowCountRef = useRef(0)
-  const aboveCountRef = useRef(0)
+  const openRef = useRef(false) // whether a mismatch incident is currently open
+  const belowCountRef = useRef(0) // consecutive mismatching ticks
+  const aboveCountRef = useRef(0) // consecutive matching ticks
   const tickRunningRef = useRef(false)
 
-  const incidentState = useProctoringStore((s) => s.incidentState)
-  const currentScore = useProctoringStore((s) => s.currentScore)
-  const incidentId = useProctoringStore((s) => s.incidentId)
-  const snapshotCount = useProctoringStore((s) => s.snapshotCount)
+  // Keep the latest callbacks in refs so the long-lived interval always calls
+  // the current versions without needing to restart the effect.
+  const onMismatchRef = useRef(onMismatch)
+  const onMatchRef = useRef(onMatch)
+  const onStatusRef = useRef(onStatus)
+  useEffect(() => {
+    onMismatchRef.current = onMismatch
+    onMatchRef.current = onMatch
+    onStatusRef.current = onStatus
+  })
+  const status = (message: string) => onStatusRef.current?.(message)
 
   useEffect(() => {
     if (!sessionId) {
       console.warn('⚠️ useFaceProctoring: missing sessionId, proctoring disabled')
+      status('Wrong-face check DISABLED: no sessionId/idNo in URL')
       return
     }
 
-    const store = useProctoringStore.getState()
     let cancelled = false
     let intervalId: number | null = null
 
@@ -197,106 +159,6 @@ export function useFaceProctoring({ sessionId }: FaceProctoringParams) {
       if (!el) return null
       if (el.readyState < 2 || el.videoWidth === 0 || el.paused) return null
       return el
-    }
-
-    const openIncident = async (video: HTMLVideoElement, score: number) => {
-      const startedAtMs = Date.now()
-      const startedAt = new Date(startedAtMs).toISOString()
-      const newIncidentId = makeIncidentId()
-      incidentRef.current = {
-        incidentId: newIncidentId,
-        startedAt,
-        startedAtMs,
-        lastHeartbeatAt: startedAtMs,
-        scoreAtDetection: score,
-      }
-      belowCountRef.current = 0
-      aboveCountRef.current = 0
-      store.setIncidentId(newIncidentId)
-      store.setIncidentState('DETECTED')
-
-      const blob = await captureSnapshot(video)
-      if (blob) {
-        store.incrementSnapshotCount()
-        await sendUpload(
-          {
-            sessionId,
-            startTime: startedAt,
-            endTime: startedAt,
-            incidentId: newIncidentId,
-            event: 'incident_open',
-            scoreAtDetection: score,
-          },
-          blob,
-          `face-mismatch_${newIncidentId}_open.jpg`,
-        )
-      }
-      await sendEvent({
-        sessionId,
-        timestamp: startedAt,
-        eventType: 'face-mismatch-open',
-      })
-    }
-
-    const sendHeartbeat = async (video: HTMLVideoElement, incident: ActiveIncident) => {
-      const blob = await captureSnapshot(video)
-      if (blob) {
-        store.incrementSnapshotCount()
-        await sendUpload(
-          {
-            sessionId,
-            startTime: incident.startedAt,
-            endTime: incident.startedAt,
-            incidentId: incident.incidentId,
-            event: 'incident_heartbeat',
-            scoreAtDetection: incident.scoreAtDetection,
-          },
-          blob,
-          `face-mismatch_${incident.incidentId}_heartbeat.jpg`,
-        )
-      }
-      await sendEvent({
-        sessionId,
-        timestamp: incident.startedAt,
-        eventType: 'face-mismatch-heartbeat',
-      })
-    }
-
-    const resolveIncident = async (video: HTMLVideoElement, incident: ActiveIncident) => {
-      const resolvedAtMs = Date.now()
-      const resolvedAt = new Date(resolvedAtMs).toISOString()
-      const durationMs = resolvedAtMs - incident.startedAtMs
-      store.setIncidentState('RESOLVED')
-
-      const blob = await captureSnapshot(video)
-      if (blob) {
-        store.incrementSnapshotCount()
-        await sendUpload(
-          {
-            sessionId,
-            startTime: incident.startedAt,
-            endTime: resolvedAt,
-            incidentId: incident.incidentId,
-            event: 'incident_close',
-            scoreAtDetection: incident.scoreAtDetection,
-            resolvedAt,
-            durationMs,
-          },
-          blob,
-          `face-mismatch_${incident.incidentId}_close.jpg`,
-        )
-      }
-      await sendEvent({
-        sessionId,
-        timestamp: incident.startedAt,
-        eventType: 'face-mismatch-close',
-      })
-
-      incidentRef.current = null
-      belowCountRef.current = 0
-      aboveCountRef.current = 0
-      store.setIncidentId(null)
-      store.setIncidentState('CLEAR')
     }
 
     const tick = async () => {
@@ -313,15 +175,30 @@ export function useFaceProctoring({ sessionId }: FaceProctoringParams) {
         const descriptor = await extractDescriptor(video)
         if (!descriptor) return // descriptor occasionally unavailable; skip this tick
 
-        const score = cosineSimilarity(descriptor, baseline)
-        store.setCurrentScore(score)
+        const distance = euclideanDistance(descriptor, baseline)
+        const isMismatch = distance > DISTANCE_THRESHOLD
+        console.debug(
+          `🧑‍🤝‍🧑 face distance=${distance.toFixed(3)} (threshold ${DISTANCE_THRESHOLD}) -> ${
+            isMismatch ? 'MISMATCH' : 'match'
+          }`,
+        )
+        // Surface the live reading so the host can confirm the checker is alive
+        // and see how close the comparison is to the mismatch threshold.
+        status(
+          `Wrong-face active: distance ${distance.toFixed(2)} / ${DISTANCE_THRESHOLD} -> ${
+            isMismatch ? 'mismatch' : 'match'
+          }`,
+        )
 
-        const incident = incidentRef.current
-        if (!incident) {
-          if (score < SIMILARITY_THRESHOLD) {
+        if (!openRef.current) {
+          // No incident yet — wait for the grace period before opening one.
+          if (isMismatch) {
             belowCountRef.current += 1
             if (belowCountRef.current >= GRACE_OPEN_COUNT) {
-              await openIncident(video, score)
+              openRef.current = true
+              belowCountRef.current = 0
+              aboveCountRef.current = 0
+              onMismatchRef.current(distance)
             }
           } else {
             belowCountRef.current = 0
@@ -330,19 +207,18 @@ export function useFaceProctoring({ sessionId }: FaceProctoringParams) {
         }
 
         // An incident is open.
-        if (score >= SIMILARITY_THRESHOLD) {
+        if (isMismatch) {
+          // Keep the violation alive every tick (mirrors how the other
+          // per-frame violations repeatedly fire while still detected).
+          aboveCountRef.current = 0
+          onMismatchRef.current(distance)
+        } else {
           aboveCountRef.current += 1
           if (aboveCountRef.current >= RESOLVE_COUNT) {
-            await resolveIncident(video, incident)
-          } else {
-            store.setIncidentState('PERSISTING')
-          }
-        } else {
-          aboveCountRef.current = 0
-          store.setIncidentState('PERSISTING')
-          if (Date.now() - incident.lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
-            incident.lastHeartbeatAt = Date.now()
-            await sendHeartbeat(video, incident)
+            openRef.current = false
+            aboveCountRef.current = 0
+            belowCountRef.current = 0
+            onMatchRef.current()
           }
         }
       } catch (error) {
@@ -356,19 +232,27 @@ export function useFaceProctoring({ sessionId }: FaceProctoringParams) {
       try {
         await loadModels()
         if (cancelled) return
+        status('Wrong-face check: loading KYC selfie…')
         const descriptor = await fetchKycDescriptor(sessionId)
         if (cancelled) return
         if (!descriptor) {
           console.error('❌ Could not extract a face descriptor from the KYC selfie')
+          status('Wrong-face check DISABLED: KYC selfie has no detectable face')
           return
         }
         kycDescriptorRef.current = descriptor
         console.log('✅ KYC baseline descriptor ready, starting face proctoring')
+        status('Wrong-face check active: KYC baseline ready')
         intervalId = window.setInterval(() => {
           void tick()
         }, TICK_INTERVAL_MS)
       } catch (error) {
         console.error('❌ Face proctoring initialization failed:', error)
+        status(
+          `Wrong-face check FAILED to start: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
       }
     })()
 
@@ -376,13 +260,10 @@ export function useFaceProctoring({ sessionId }: FaceProctoringParams) {
       cancelled = true
       if (intervalId) clearInterval(intervalId)
       kycDescriptorRef.current = null
-      incidentRef.current = null
+      openRef.current = false
       belowCountRef.current = 0
       aboveCountRef.current = 0
       tickRunningRef.current = false
-      useProctoringStore.getState().reset()
     }
   }, [sessionId])
-
-  return { incidentState, currentScore, incidentId, snapshotCount }
 }
