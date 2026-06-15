@@ -41,10 +41,16 @@ type SavedVideo = {
 // One event + one 10s clip per type per window is plenty for review.
 const VIOLATION_COOLDOWN_MS = 30000 // 30 seconds
 
+// Lifecycle of a recorded item in the list:
+// - 'pending'  : violation just detected, the 10s clip is still being recorded
+// - 'ready'    : clip captured, blob available, can be downloaded
+// - 'failed'   : recording produced no usable video (error / empty / too small)
+type RecordedVideoStatus = 'pending' | 'ready' | 'failed'
+
 type RecordedVideo = {
   id: string
   filename: string
-  blob: Blob
+  blob?: Blob // undefined while status === 'pending'
   mime: string
   ext: 'mp4' | 'webm'
   converted: boolean
@@ -52,7 +58,14 @@ type RecordedVideo = {
   type: 'exam' | 'violation'
   size: number
   mp4Blob?: Blob // Optional pre-converted MP4 blob
+  status: RecordedVideoStatus
+  recordingStartedAt?: number // Date.now() when recording began (drives progress bar)
+  recordingDurationMs?: number // expected clip length, used to estimate progress
 }
+
+// A violation clip records for exactly 10 seconds from detection (see the stop
+// timeout in startViolationRecording). Used to estimate the pending progress bar.
+const VIOLATION_CLIP_DURATION_MS = 10000
 
 
 export default function App() {
@@ -64,7 +77,10 @@ export default function App() {
   const [webcamError, setWebcamError] = useState<string | null>(null)
   const [webcamReady, setWebcamReady] = useState(false)
   const detectionCountRef = useRef<{ type: DetectionType; count: number }>({ type: null, count: 0 })
-  const faceNotVisibleCountRef = useRef<number>(0) // Track consecutive frames without face detection
+  const faceNotVisibleSinceRef = useRef<number | null>(null) // Timestamp when face first became not visible
+  const multipleFacesSinceRef = useRef<number | null>(null) // Timestamp when multiple faces first appeared
+  const isDetectingRef = useRef<boolean>(false) // Guard against overlapping detection cycles
+  const lastTimingLogRef = useRef<number>(0) // Throttle for frame-timing diagnostics
   const faceDetectorRef = useRef<FaceDetector | null>(null)
   const objectDetectorRef = useRef<ObjectDetector | null>(null)
   const detectionIntervalRef = useRef<number | null>(null) // Store interval ID for detection
@@ -173,6 +189,9 @@ export default function App() {
   const violationChunksByTypeRef = useRef<Map<DetectionType, Blob[]>>(new Map())
   const violationTimeoutsRef = useRef<Map<DetectionType, number>>(new Map())
   const violationDetectionTimesRef = useRef<Map<DetectionType, Date>>(new Map())
+  // Id of the "pending" list entry created when a violation is first detected,
+  // so onstop can finalize (or fail) the very same item it created.
+  const violationPendingIdsRef = useRef<Map<DetectionType, string>>(new Map())
   
   // UI state
   const [isOverlayEnabled, setIsOverlayEnabled] = useState(true)
@@ -181,6 +200,16 @@ export default function App() {
   
   // Recorded videos list
   const [recordedVideos, setRecordedVideos] = useState<RecordedVideo[]>([])
+
+  // Ticking clock used to animate the "pending" progress bars. Only runs while
+  // at least one item is still recording, so it costs nothing when idle.
+  const [nowTick, setNowTick] = useState(() => Date.now())
+  const hasPendingVideos = recordedVideos.some(v => v.status === 'pending')
+  useEffect(() => {
+    if (!hasPendingVideos) return
+    const intervalId = window.setInterval(() => setNowTick(Date.now()), 200)
+    return () => clearInterval(intervalId)
+  }, [hasPendingVideos])
 
   // Refs for auto-scrolling
   const logSectionRef = useRef<HTMLTextAreaElement>(null)
@@ -386,6 +415,7 @@ export default function App() {
     const eventType = getEventTypeFromDetectionType(detectionType)
     if (eventType) {
       lastEventSentRef.current.delete(eventType)
+      lastLogTimeRef.current.delete(eventType) // also clear the visible-log throttle so the log line tallies with the new clip
     }
     lastVideoUploadRef.current.delete(detectionType)
   }, [getEventTypeFromDetectionType])
@@ -407,9 +437,11 @@ export default function App() {
 
     const now = Date.now()
     const lastLogTime = lastLogTimeRef.current.get(throttleKey) || 0
-    const LOG_THROTTLE_INTERVAL_MS = 10000 // 10 seconds between repeated log lines
+    // Match the recording/clip cooldown so a continuous violation produces one log
+    // line per recorded clip — keeping the log list tallied with the video list.
+    const LOG_THROTTLE_INTERVAL_MS = VIOLATION_COOLDOWN_MS
 
-    // For repeating logs, only show if 10 seconds have passed since last occurrence
+    // For repeating logs, only show if the cooldown window has passed since last occurrence
     if (lastLogTime > 0 && now - lastLogTime < LOG_THROTTLE_INTERVAL_MS) {
       return
     }
@@ -529,10 +561,63 @@ export default function App() {
       type,
       size: savedVideo.blob.size,
       mp4Blob: savedVideo.converted && savedVideo.ext === 'mp4' ? savedVideo.blob : undefined,
+      status: 'ready',
     }
 
     setRecordedVideos(prev => [...prev, recordedVideo])
     return id
+  }, [])
+
+  // Add a placeholder entry the moment a violation is detected, so the item
+  // shows up in the list right away with a "pending" status + progress bar.
+  // The matching clip is filled in later via finalizeRecordedVideo / markRecordedVideoFailed.
+  const addPendingRecordedVideo = useCallback((filename: string, ext: 'mp4' | 'webm'): string => {
+    const id = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+    const recordedVideo: RecordedVideo = {
+      id,
+      filename,
+      blob: undefined,
+      mime: '',
+      ext,
+      converted: false,
+      timestamp: new Date(),
+      type: 'violation',
+      size: 0,
+      status: 'pending',
+      recordingStartedAt: Date.now(),
+      recordingDurationMs: VIOLATION_CLIP_DURATION_MS,
+    }
+
+    setRecordedVideos(prev => [...prev, recordedVideo])
+    return id
+  }, [])
+
+  // Swap a pending entry's placeholder for the finished clip and mark it ready.
+  const finalizeRecordedVideo = useCallback((id: string, savedVideo: SavedVideo, filename: string) => {
+    setRecordedVideos(prev =>
+      prev.map(v =>
+        v.id === id
+          ? {
+              ...v,
+              filename,
+              blob: savedVideo.blob,
+              mime: savedVideo.mime,
+              ext: savedVideo.ext,
+              converted: savedVideo.converted,
+              size: savedVideo.blob.size,
+              mp4Blob: savedVideo.converted && savedVideo.ext === 'mp4' ? savedVideo.blob : undefined,
+              status: 'ready',
+            }
+          : v
+      )
+    )
+  }, [])
+
+  // Mark a pending entry as failed (no usable clip was produced).
+  const markRecordedVideoFailed = useCallback((id: string) => {
+    setRecordedVideos(prev =>
+      prev.map(v => (v.id === id ? { ...v, status: 'failed' } : v))
+    )
   }, [])
 
   // MediaRecorder for chunk access (needed for periodic saving)
@@ -785,6 +870,20 @@ export default function App() {
     violationChunksByTypeRef.current.set(violationType, [])
     violationDetectionTimesRef.current.set(violationType, detectionTime)
 
+    // Add a "pending" item to the list immediately so the violation shows up
+    // right away (with a progress bar) while the 10s clip is still recording.
+    const pendingExt: 'mp4' | 'webm' = getBestMimeType().includes('webm') ? 'webm' : 'mp4'
+    const pendingTimestamp = detectionTime.toISOString().replace(/[:.]/g, '-').slice(0, -5)
+    const pendingViolationTypeStr = violationType === 'cell_phone' ? 'cell_phone_detection' :
+                                    violationType === 'multiple_faces' ? 'multiple_faces_detection' :
+                                    violationType === 'face_not_visible' ? 'face_not_visible_detection' :
+                                    violationType === 'tab_switch' ? 'tab_switch_detection' :
+                                    violationType === 'wrong_face' ? 'wrong_face_detection' :
+                                    'violation'
+    const pendingFilename = `${pendingViolationTypeStr}_${pendingTimestamp}.${pendingExt}`
+    const pendingId = addPendingRecordedVideo(pendingFilename, pendingExt)
+    violationPendingIdsRef.current.set(violationType, pendingId)
+
     try {
       // Clear any existing timeout for this violation type
       const existingTimeout = violationTimeoutsRef.current.get(violationType)
@@ -823,7 +922,16 @@ export default function App() {
       recorder.onstop = async () => {
         // Wait a moment to ensure all data is available
         await new Promise(resolve => setTimeout(resolve, 100))
-        
+
+        // Flip this type's pending list entry to "failed" (or drop it if absent).
+        const failPendingForType = (type: DetectionType) => {
+          const id = violationPendingIdsRef.current.get(type)
+          if (id) {
+            markRecordedVideoFailed(id)
+            violationPendingIdsRef.current.delete(type)
+          }
+        }
+
         const chunks = violationChunksByTypeRef.current.get(currentViolationType) || []
         const detectionTime = violationDetectionTimesRef.current.get(currentViolationType)
         
@@ -834,15 +942,17 @@ export default function App() {
           violationRecordersRef.current.delete(currentViolationType)
           violationChunksByTypeRef.current.delete(currentViolationType)
           violationDetectionTimesRef.current.delete(currentViolationType)
+          failPendingForType(currentViolationType)
           return
         }
-        
+
         if (!detectionTime) {
           console.error(`❌ Missing detection time for ${currentViolationType}`)
           activeRecordingByTypeRef.current.set(currentViolationType, false)
           violationRecordersRef.current.delete(currentViolationType)
           violationChunksByTypeRef.current.delete(currentViolationType)
           violationDetectionTimesRef.current.delete(currentViolationType)
+          failPendingForType(currentViolationType)
           return
         }
         
@@ -857,6 +967,7 @@ export default function App() {
             violationRecordersRef.current.delete(currentViolationType)
             violationChunksByTypeRef.current.delete(currentViolationType)
             violationDetectionTimesRef.current.delete(currentViolationType)
+            failPendingForType(currentViolationType)
             return
           }
           
@@ -873,12 +984,24 @@ export default function App() {
                                    'violation'
           const baseFilename = `${violationTypeStr}_${timestamp}`
 
-          // Add the clip (WebM) to the recorded list so it shows up right away.
-          addRecordedVideo(
-            { blob: fixedBlob, mime: currentMimeType, ext: baseExt, converted: false },
-            `${baseFilename}.${baseExt}`,
-            'violation'
-          )
+          // Fill in the pending list entry created at recording start (swap the
+          // placeholder for the finished clip and flip it to "ready"). If for any
+          // reason the pending id is gone, fall back to adding a fresh entry.
+          const pendingId = violationPendingIdsRef.current.get(currentViolationType)
+          if (pendingId) {
+            finalizeRecordedVideo(
+              pendingId,
+              { blob: fixedBlob, mime: currentMimeType, ext: baseExt, converted: false },
+              `${baseFilename}.${baseExt}`
+            )
+            violationPendingIdsRef.current.delete(currentViolationType)
+          } else {
+            addRecordedVideo(
+              { blob: fixedBlob, mime: currentMimeType, ext: baseExt, converted: false },
+              `${baseFilename}.${baseExt}`,
+              'violation'
+            )
+          }
 
           // Map violation type to eventType format
           const eventTypeMap: Record<string, string> = {
@@ -915,6 +1038,7 @@ export default function App() {
           violationChunksByTypeRef.current.delete(currentViolationType)
           violationDetectionTimesRef.current.delete(currentViolationType)
           violationTimeoutsRef.current.delete(currentViolationType)
+          failPendingForType(currentViolationType)
         }
       }
       
@@ -925,6 +1049,11 @@ export default function App() {
         violationChunksByTypeRef.current.delete(violationType)
         violationDetectionTimesRef.current.delete(violationType)
         violationTimeoutsRef.current.delete(violationType)
+        const pid = violationPendingIdsRef.current.get(violationType)
+        if (pid) {
+          markRecordedVideoFailed(pid)
+          violationPendingIdsRef.current.delete(violationType)
+        }
       }
       
       // Start recording
@@ -936,6 +1065,11 @@ export default function App() {
         violationRecordersRef.current.delete(violationType)
         violationChunksByTypeRef.current.delete(violationType)
         violationDetectionTimesRef.current.delete(violationType)
+        const pid = violationPendingIdsRef.current.get(violationType)
+        if (pid) {
+          markRecordedVideoFailed(pid)
+          violationPendingIdsRef.current.delete(violationType)
+        }
         throw startError
       }
       
@@ -967,8 +1101,13 @@ export default function App() {
       violationRecordersRef.current.delete(violationType)
       violationChunksByTypeRef.current.delete(violationType)
       violationDetectionTimesRef.current.delete(violationType)
+      const pid = violationPendingIdsRef.current.get(violationType)
+      if (pid) {
+        markRecordedVideoFailed(pid)
+        violationPendingIdsRef.current.delete(violationType)
+      }
     }
-  }, [addLogEntry, getBestMimeType, addRecordedVideo, validateBlobDuration, sendVideoToAPI])
+  }, [addLogEntry, getBestMimeType, addRecordedVideo, addPendingRecordedVideo, finalizeRecordedVideo, markRecordedVideoFailed, validateBlobDuration, sendVideoToAPI])
 
 
   // Add violation to list when detected
@@ -1110,8 +1249,16 @@ export default function App() {
 
 
   const detectWithMediaPipe = async () => {
+    // Guard against overlapping detection cycles. The interval re-fires every
+    // 100ms, but a single cycle runs two heavy MediaPipe models back-to-back
+    // and can exceed that budget. Without this guard, overlapping
+    // detectForVideo calls throw on non-monotonic timestamps and the whole
+    // frame is silently dropped.
+    if (isDetectingRef.current) return
+    isDetectingRef.current = true
+    try {
     const video = getVideoElement()
-    
+
     if (
       video &&
       video.readyState === 4 &&
@@ -1130,12 +1277,24 @@ export default function App() {
 
         try {
           const startTimeMs = performance.now()
-          
+
           // Run MediaPipe Face Detection
           const faceResults = faceDetectorRef.current.detectForVideo(video, startTimeMs)
-          
+
           // Run MediaPipe Object Detection for smartphones
           const objectResults = objectDetectorRef.current.detectForVideo(video, startTimeMs)
+
+          // Throttled frame-timing diagnostics: confirm whether the ~100ms
+          // detection loop budget is actually being met (logged at most once
+          // every ~3s). Informational only - no behavior change.
+          const cycleMs = performance.now() - startTimeMs
+          const nowForTiming = Date.now()
+          if (nowForTiming - lastTimingLogRef.current >= 3000) {
+            lastTimingLogRef.current = nowForTiming
+            console.debug(
+              `[proctoring] MediaPipe detection cycle: ${cycleMs.toFixed(1)}ms (budget 100ms)`
+            )
+          }
 
           const ctx = canvasRef.current.getContext('2d')
           if (ctx) {
@@ -1280,9 +1439,12 @@ export default function App() {
 
           // Detection thresholds for MediaPipe
           const REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE = 2 // 2 frames (0.2 seconds) - smooth detection with higher confidence
-          const REQUIRED_CONSECUTIVE_DETECTIONS_MULTIPLE_FACES = 8 // 8 frames (0.8 seconds) - reduced from 10 with better NMS
-          const REQUIRED_CONSECUTIVE_FACE_MISSES = 20 // 20 frames (2.0 seconds)
           const CELL_PHONE_DEBOUNCE_MS = 800 // 0.8 seconds debounce for smoother detection
+          // Time-based gating for face-count violations (frame-count gating was
+          // unreliable when the loop ran slower than 100ms/frame). Near-instant
+          // alerting per requirement; raise to 500-800ms if too noisy.
+          const FACE_NOT_VISIBLE_THRESHOLD_MS = 150
+          const MULTIPLE_FACES_THRESHOLD_MS = 150
           
           let currentDetection: DetectionType = null
           
@@ -1357,77 +1519,93 @@ export default function App() {
             resetEventDetectionCount('cell_phone') // Reset detection count when violation ends
           }
 
-          // Check for multiple faces
-          if (faceCount > 1 && !currentDetection) {
-            currentDetection = 'multiple_faces'
-            latestDetectionScoreRef.current = { type: 'multiple_faces', score: faceCount }
-          } else if (faceCount <= 1 && activeMultipleFacesViolationRef.current !== null) {
-            // End multiple faces violation (add 10 seconds after)
-            setViolations(prev => {
-              const activeIndex = activeMultipleFacesViolationRef.current
-              if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'multiple_faces') {
-                const updated = [...prev]
-                const currentTime = new Date()
-                updated[activeIndex] = {
-                  ...updated[activeIndex],
-                  endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
-                }
-                
-                // Violation recording stops automatically after 10 seconds from detection
-                // No need to schedule stop here
-                
-                return updated
+          // Check for multiple faces (time-based gating, fired directly)
+          if (faceCount > 1) {
+            if (multipleFacesSinceRef.current === null) multipleFacesSinceRef.current = Date.now()
+
+            if (Date.now() - multipleFacesSinceRef.current >= MULTIPLE_FACES_THRESHOLD_MS && !currentDetection) {
+              currentDetection = 'multiple_faces'
+              latestDetectionScoreRef.current = { type: 'multiple_faces', score: faceCount }
+
+              // Fire directly, bypassing the consecutive-frame debounce
+              const streamToUse = getMediaStream()
+              const examIsActive = isExamActiveRef.current || isExamActive
+              if (examIsActive && streamToUse) {
+                startViolationRecording(streamToUse, new Date(), 'multiple_faces').catch((error) => {
+                  console.error('Error starting violation recording:', error)
+                })
               }
-              return prev
-            })
-            activeMultipleFacesViolationRef.current = null
-            resetEventDetectionCount('multiple_faces') // Reset detection count when violation ends
+              addViolation('multiple_faces', faceCount)
+            }
+          } else {
+            multipleFacesSinceRef.current = null
+            if (activeMultipleFacesViolationRef.current !== null) {
+              // End multiple faces violation (add 10 seconds after)
+              setViolations(prev => {
+                const activeIndex = activeMultipleFacesViolationRef.current
+                if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'multiple_faces') {
+                  const updated = [...prev]
+                  const currentTime = new Date()
+                  updated[activeIndex] = {
+                    ...updated[activeIndex],
+                    endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
+                  }
+                  return updated
+                }
+                return prev
+              })
+              activeMultipleFacesViolationRef.current = null
+              resetEventDetectionCount('multiple_faces') // Reset detection count when violation ends
+            }
           }
 
-          // Check for face not visible
+          // Check for face not visible (time-based; only if nothing higher-priority detected)
           if (faceCount === 0 && !currentDetection) {
-            faceNotVisibleCountRef.current++
-            
-            if (faceNotVisibleCountRef.current >= REQUIRED_CONSECUTIVE_FACE_MISSES) {
+            if (faceNotVisibleSinceRef.current === null) faceNotVisibleSinceRef.current = Date.now()
+
+            if (Date.now() - faceNotVisibleSinceRef.current >= FACE_NOT_VISIBLE_THRESHOLD_MS) {
               currentDetection = 'face_not_visible'
               latestDetectionScoreRef.current = { type: 'face_not_visible', score: 0 }
-              
+
+              // Fire directly, bypassing the consecutive-frame debounce
+              const streamToUse = getMediaStream()
+              const examIsActive = isExamActiveRef.current || isExamActive
+              if (examIsActive && streamToUse) {
+                startViolationRecording(streamToUse, new Date(), 'face_not_visible').catch((error) => {
+                  console.error('Error starting violation recording:', error)
+                })
+              }
+              addViolation('face_not_visible', 0)
             }
           } else if (faceCount > 0) {
-            faceNotVisibleCountRef.current = 0
-            
-            if (detectionCountRef.current.type === 'face_not_visible') {
-              detectionCountRef.current = { type: null, count: 0 }
-              
-              if (activeFaceNotVisibleViolationRef.current !== null) {
-                setViolations(prev => {
-                  const activeIndex = activeFaceNotVisibleViolationRef.current
-                  if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'face_not_visible') {
-                    const updated = [...prev]
-                    const currentTime = new Date()
-                    updated[activeIndex] = {
-                      ...updated[activeIndex],
-                      endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
-                    }
-                    
-                    // Violation recording stops automatically after 10 seconds from detection
-                    // No need to schedule stop here
-                    
-                    return updated
+            faceNotVisibleSinceRef.current = null
+            if (activeFaceNotVisibleViolationRef.current !== null) {
+              setViolations(prev => {
+                const activeIndex = activeFaceNotVisibleViolationRef.current
+                if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'face_not_visible') {
+                  const updated = [...prev]
+                  const currentTime = new Date()
+                  updated[activeIndex] = {
+                    ...updated[activeIndex],
+                    endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
                   }
-                  return prev
-                })
-                activeFaceNotVisibleViolationRef.current = null
-                resetEventDetectionCount('face_not_visible') // Reset detection count when violation ends
-              }
+                  return updated
+                }
+                return prev
+              })
+              activeFaceNotVisibleViolationRef.current = null
+              resetEventDetectionCount('face_not_visible') // Reset detection count when violation ends
             }
           }
 
-          // Track consecutive detections to reduce false positives
-          if (currentDetection === detectionCountRef.current.type) {
+          // Track consecutive cell-phone detections to reduce false positives.
+          // multiple_faces / face_not_visible are now fired directly above and
+          // no longer flow through this consecutive-frame debounce.
+          const cellPhoneDetection: DetectionType = currentDetection === 'cell_phone' ? 'cell_phone' : null
+          if (cellPhoneDetection === detectionCountRef.current.type) {
             detectionCountRef.current.count++
           } else {
-            // End active violations if switching to a different type (add 10 seconds after)
+            // End active cell-phone violation if switching away (add 10 seconds after)
             if (detectionCountRef.current.type === 'cell_phone' && activeCellPhoneViolationRef.current !== null) {
               setViolations(prev => {
                 const activeIndex = activeCellPhoneViolationRef.current
@@ -1445,117 +1623,44 @@ export default function App() {
               activeCellPhoneViolationRef.current = null
               resetEventDetectionCount('cell_phone') // Reset detection count when violation ends
             }
-            
-            if (detectionCountRef.current.type === 'multiple_faces' && activeMultipleFacesViolationRef.current !== null) {
-              setViolations(prev => {
-                const activeIndex = activeMultipleFacesViolationRef.current
-                if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'multiple_faces') {
-                  const updated = [...prev]
-                  const currentTime = new Date()
-                  updated[activeIndex] = {
-                    ...updated[activeIndex],
-                    endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
-                  }
-                  return updated
-                }
-                return prev
-              })
-              activeMultipleFacesViolationRef.current = null
-              resetEventDetectionCount('multiple_faces') // Reset detection count when violation ends
-            }
-            
-            detectionCountRef.current.type = currentDetection
-            detectionCountRef.current.count = currentDetection ? 1 : 0
+
+            detectionCountRef.current.type = cellPhoneDetection
+            detectionCountRef.current.count = cellPhoneDetection ? 1 : 0
           }
 
-          // Only trigger violation after required consecutive detections
+          // Only trigger the cell-phone violation after required consecutive detections
           const confirmedDetection = detectionCountRef.current.type
-          const requiredConsecutive = confirmedDetection === 'cell_phone' 
-            ? REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE 
-            : confirmedDetection === 'multiple_faces'
-            ? REQUIRED_CONSECUTIVE_DETECTIONS_MULTIPLE_FACES
-            : REQUIRED_CONSECUTIVE_FACE_MISSES
-          
-          const hasEnoughConsecutiveDetections = detectionCountRef.current.count >= requiredConsecutive && !!confirmedDetection
-          
+          const hasEnoughConsecutiveDetections =
+            detectionCountRef.current.count >= REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE &&
+            confirmedDetection === 'cell_phone'
+
           // For cell phones, also check debounce
           let shouldTriggerAlert: boolean = hasEnoughConsecutiveDetections
           if (confirmedDetection === 'cell_phone' && hasEnoughConsecutiveDetections) {
             const now = Date.now()
             const timeSinceLastDetection = now - lastCellPhoneDetectionTimeRef.current
             shouldTriggerAlert = timeSinceLastDetection >= CELL_PHONE_DEBOUNCE_MS
-            
           }
-          
-          if (shouldTriggerAlert) {
-            // Log violation
-            if (confirmedDetection === 'cell_phone') {
-              // Start violation recording automatically (will be ignored if already recording this type)
-              const streamToUse = getMediaStream()
-              const examIsActive = isExamActiveRef.current || isExamActive // Check both ref and state
-              
-              if (examIsActive && streamToUse) {
-                const detectionTime = new Date()
-                // Fire and forget - violation recording runs in background
-                // startViolationRecording will ignore if same type is already recording
-                startViolationRecording(streamToUse, detectionTime, 'cell_phone').catch((error) => {
-                  console.error('Error starting violation recording:', error)
-                })
-              }
-              lastCellPhoneDetectionTimeRef.current = Date.now()
-            } else if (confirmedDetection === 'multiple_faces') {
-              // Start violation recording automatically (will be ignored if already recording this type)
-              const streamToUse = getMediaStream()
-              const examIsActive = isExamActiveRef.current || isExamActive // Check both ref and state
-              
-              if (examIsActive && streamToUse) {
-                const detectionTime = new Date()
-                // startViolationRecording will ignore if same type is already recording
-                startViolationRecording(streamToUse, detectionTime, 'multiple_faces').catch((error) => {
-                  console.error('Error starting violation recording:', error)
-                })
-              }
-            } else if (confirmedDetection === 'face_not_visible') {
-              // Start violation recording automatically (will be ignored if already recording this type)
-              const streamToUse = getMediaStream()
-              const examIsActive = isExamActiveRef.current || isExamActive // Check both ref and state
-              
-              if (examIsActive && streamToUse) {
-                const detectionTime = new Date()
-                // startViolationRecording will ignore if same type is already recording
-                startViolationRecording(streamToUse, detectionTime, 'face_not_visible').catch((error) => {
-                  console.error('Error starting violation recording:', error)
-                })
-              }
-            }
 
-            if (confirmedDetection) {
-              const violationScore = latestDetectionScoreRef.current?.type === confirmedDetection
-                ? latestDetectionScoreRef.current.score
-                : undefined
-              
-              // Continuously update violation duration for these types
-              if (confirmedDetection === 'face_not_visible' || confirmedDetection === 'cell_phone' || confirmedDetection === 'multiple_faces' || confirmedDetection === 'tab_switch') {
-                addViolation(confirmedDetection, violationScore)
-              } else {
-                addViolation(confirmedDetection, violationScore)
-                detectionCountRef.current.count = 0
-              }
+          if (shouldTriggerAlert && confirmedDetection === 'cell_phone') {
+            // Start violation recording automatically (will be ignored if already recording this type)
+            const streamToUse = getMediaStream()
+            const examIsActive = isExamActiveRef.current || isExamActive // Check both ref and state
+
+            if (examIsActive && streamToUse) {
+              const detectionTime = new Date()
+              // Fire and forget - violation recording runs in background
+              // startViolationRecording will ignore if same type is already recording
+              startViolationRecording(streamToUse, detectionTime, 'cell_phone').catch((error) => {
+                console.error('Error starting violation recording:', error)
+              })
             }
-          } else if (confirmedDetection === 'face_not_visible' && activeFaceNotVisibleViolationRef.current !== null) {
-            setViolations(prev => {
-              const activeIndex = activeFaceNotVisibleViolationRef.current
-              if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'face_not_visible') {
-                const updated = [...prev]
-                const currentTime = new Date()
-                updated[activeIndex] = {
-                  ...updated[activeIndex],
-                  endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
-                }
-                return updated
-              }
-              return prev
-            })
+            lastCellPhoneDetectionTimeRef.current = Date.now()
+
+            const violationScore = latestDetectionScoreRef.current?.type === 'cell_phone'
+              ? latestDetectionScoreRef.current.score
+              : undefined
+            addViolation('cell_phone', violationScore)
           } else if (confirmedDetection === 'cell_phone' && activeCellPhoneViolationRef.current !== null) {
             setViolations(prev => {
               const activeIndex = activeCellPhoneViolationRef.current
@@ -1565,23 +1670,9 @@ export default function App() {
                 updated[activeIndex] = {
                   ...updated[activeIndex],
                   endTime: new Date(currentTime.getTime() + 10000), // +10 seconds after detection ends
-                  score: latestDetectionScoreRef.current?.type === 'cell_phone' 
-                    ? latestDetectionScoreRef.current.score 
+                  score: latestDetectionScoreRef.current?.type === 'cell_phone'
+                    ? latestDetectionScoreRef.current.score
                     : updated[activeIndex].score
-                }
-                return updated
-              }
-              return prev
-            })
-          } else if (confirmedDetection === 'multiple_faces' && activeMultipleFacesViolationRef.current !== null) {
-            setViolations(prev => {
-              const activeIndex = activeMultipleFacesViolationRef.current
-              if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'multiple_faces') {
-                const updated = [...prev]
-                const currentTime = new Date()
-                updated[activeIndex] = {
-                  ...updated[activeIndex],
-                  endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
                 }
                 return updated
               }
@@ -1593,6 +1684,9 @@ export default function App() {
           console.error('Error during MediaPipe detection:', error)
         }
       } // Close canvasRef.current if statement
+    }
+    } finally {
+      isDetectingRef.current = false
     }
   }
 
@@ -1874,7 +1968,7 @@ export default function App() {
           {/* Video Feed - Takes 2 columns */}
           <Card className="bg-orange-50 border-orange-200 lg:col-span-2">
             <CardContent className="p-0">
-              <div className="relative w-full aspect-video bg-black rounded-lg overflow-hidden">
+              <div className="relative w-full max-w-sm mx-auto aspect-video bg-black rounded-lg overflow-hidden">
                 {webcamError ? (
                   <div className="w-full h-full flex flex-col items-center justify-center text-white p-4">
                     <p className="text-lg font-semibold mb-2">Camera Access Error</p>
@@ -2011,7 +2105,18 @@ export default function App() {
                 </div>
               ) : (
                 <div ref={recordingListRef} className="space-y-2 max-h-[400px] overflow-y-auto">
-                  {recordedVideos.map((video) => (
+                  {recordedVideos.map((video) => {
+                    // Estimated progress (0-100) for clips still being recorded.
+                    const elapsed = video.recordingStartedAt ? nowTick - video.recordingStartedAt : 0
+                    const durationMs = video.recordingDurationMs || VIOLATION_CLIP_DURATION_MS
+                    const progress = video.status === 'pending'
+                      ? Math.min(99, Math.max(0, Math.round((elapsed / durationMs) * 100)))
+                      : 100
+                    const remainingSec = video.status === 'pending'
+                      ? Math.max(0, Math.ceil((durationMs - elapsed) / 1000))
+                      : 0
+
+                    return (
                     <div
                       key={video.id}
                       className="bg-white border border-gray-300 rounded-md p-3 flex items-center justify-between hover:bg-gray-50 transition-colors"
@@ -2036,40 +2141,75 @@ export default function App() {
                           >
                             {video.ext.toUpperCase()}
                           </span>
+                          {video.status === 'pending' && (
+                            <span className="px-2 py-1 rounded text-xs font-semibold bg-amber-100 text-amber-800 inline-flex items-center gap-1">
+                              <span className="w-2 h-2 bg-amber-500 rounded-full animate-pulse"></span>
+                              Pending
+                            </span>
+                          )}
+                          {video.status === 'ready' && (
+                            <span className="px-2 py-1 rounded text-xs font-semibold bg-emerald-100 text-emerald-800">
+                              Ready
+                            </span>
+                          )}
+                          {video.status === 'failed' && (
+                            <span className="px-2 py-1 rounded text-xs font-semibold bg-gray-200 text-gray-700">
+                              Failed
+                            </span>
+                          )}
                         </div>
                         <p className="text-sm font-medium text-gray-900 truncate">{video.filename}</p>
-                        <div className="flex items-center gap-4 mt-1 text-xs text-gray-500">
-                          <span>
-                            {video.timestamp.toLocaleString('en-US', {
-                              month: '2-digit',
-                              day: '2-digit',
-                              year: 'numeric',
-                              hour: '2-digit',
-                              minute: '2-digit',
-                              second: '2-digit',
-                              hour12: true
-                            })}
-                          </span>
-                          <span>
-                            {(video.size / (1024 * 1024)).toFixed(2)} MB
-                          </span>
-                        </div>
+                        {video.status === 'pending' ? (
+                          <div className="mt-2">
+                            <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-amber-500 transition-all duration-200 ease-linear"
+                                style={{ width: `${progress}%` }}
+                              ></div>
+                            </div>
+                            <div className="flex items-center justify-between mt-1 text-xs text-gray-500">
+                              <span>Recording… {progress}%</span>
+                              <span>~{remainingSec}s left</span>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-4 mt-1 text-xs text-gray-500">
+                            <span>
+                              {video.timestamp.toLocaleString('en-US', {
+                                month: '2-digit',
+                                day: '2-digit',
+                                year: 'numeric',
+                                hour: '2-digit',
+                                minute: '2-digit',
+                                second: '2-digit',
+                                hour12: true
+                              })}
+                            </span>
+                            {video.status === 'ready' && (
+                              <span>
+                                {(video.size / (1024 * 1024)).toFixed(2)} MB
+                              </span>
+                            )}
+                          </div>
+                        )}
                       </div>
                       <div className="ml-4 flex gap-2">
                         <Button
                           type="button"
+                          disabled={video.status !== 'ready'}
                           onClick={(e) => {
                             e.preventDefault()
                             e.stopPropagation()
                             downloadVideo(video)
                           }}
-                          className="bg-teal-600 hover:bg-teal-700 text-white font-semibold px-4 py-2 text-sm"
+                          className="bg-teal-600 hover:bg-teal-700 text-white font-semibold px-4 py-2 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
                         >
-                          Download
+                          {video.status === 'pending' ? 'Recording…' : 'Download'}
                         </Button>
                       </div>
                     </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </CardContent>
