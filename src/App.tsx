@@ -41,6 +41,14 @@ type SavedVideo = {
 // One event + one 10s clip per type per window is plenty for review.
 const VIOLATION_COOLDOWN_MS = 30000 // 30 seconds
 
+// Episode grace period. A violation re-fires every detection frame while it is
+// visible but can also briefly drop out (a face turning, a phone moving out of
+// frame for a moment). We treat a violation as one continuous "episode" until it
+// has been ABSENT for longer than this gap. Only then do we close the episode
+// (clearing the cooldown windows), so a 1–2s dropout does not produce a
+// duplicate event/upload, while detection of the FIRST frame stays immediate.
+const EPISODE_GAP_MS = 3000 // 3 seconds
+
 // Lifecycle of a recorded item in the list:
 // - 'pending'  : violation just detected, the 10s clip is still being recorded
 // - 'ready'    : clip captured, blob available, can be downloaded
@@ -115,6 +123,10 @@ export default function App() {
   // given violation type may hit the event endpoint and upload a video clip.
   const lastEventSentRef = useRef<Map<string, number>>(new Map()) // eventType -> last /event send time
   const lastVideoUploadRef = useRef<Map<DetectionType, number>>(new Map()) // type -> last clip recording start time
+  // Episode bookkeeping — see EPISODE_GAP_MS. Records the last time each violation
+  // type was seen, so we only close the episode (resetEventDetectionCount) after
+  // the violation has been absent for longer than the grace period.
+  const lastSeenRef = useRef<Map<DetectionType, number>>(new Map()) // type -> last detection time
   
   // Exam recording state
   const [isExamActive, setIsExamActive] = useState(false)
@@ -678,6 +690,7 @@ export default function App() {
       // Reset per-type cooldown windows when exam starts
       lastEventSentRef.current.clear()
       lastVideoUploadRef.current.clear()
+      lastSeenRef.current.clear()
 
       // NO exam video segments - NO periodic recording
     } catch (error) {
@@ -808,6 +821,7 @@ export default function App() {
       // Reset per-type cooldown windows when exam ends
       lastEventSentRef.current.clear()
       lastVideoUploadRef.current.clear()
+      lastSeenRef.current.clear()
 
       // No final exam video to save - only violation recordings are saved
 
@@ -1249,6 +1263,20 @@ export default function App() {
 
 
   const detectWithMediaPipe = async () => {
+    // Episode-gap sweep: close an episode (clearing its cooldown windows) ONLY
+    // after the violation has been absent for longer than EPISODE_GAP_MS. This
+    // runs every tick (~100ms) and covers every violation type — including the
+    // event-driven ones (tab_switch, wrong_face) — so a brief dropout never
+    // re-triggers a duplicate event/upload, while a genuine new occurrence after
+    // the gap is treated fresh.
+    const nowEpisodeSweep = Date.now()
+    for (const [type, lastSeen] of lastSeenRef.current.entries()) {
+      if (nowEpisodeSweep - lastSeen > EPISODE_GAP_MS) {
+        resetEventDetectionCount(type)
+        lastSeenRef.current.delete(type)
+      }
+    }
+
     // Guard against overlapping detection cycles. The interval re-fires every
     // 100ms, but a single cycle runs two heavy MediaPipe models back-to-back
     // and can exceed that budget. Without this guard, overlapping
@@ -1479,6 +1507,9 @@ export default function App() {
             })
           }
           
+          // Keep the cell-phone episode alive while the phone is visible.
+          if (isCellPhoneDetected) lastSeenRef.current.set('cell_phone', Date.now())
+
           // Set cell phone detection if phone detected
           if (isCellPhoneDetected && !currentDetection) {
             currentDetection = 'cell_phone'
@@ -1516,11 +1547,13 @@ export default function App() {
               return prev
             })
             activeCellPhoneViolationRef.current = null
-            resetEventDetectionCount('cell_phone') // Reset detection count when violation ends
+            // Episode close (resetEventDetectionCount) is deferred to the
+            // EPISODE_GAP_MS sweep so a brief dropout doesn't re-fire event/upload.
           }
 
           // Check for multiple faces (time-based gating, fired directly)
           if (faceCount > 1) {
+            lastSeenRef.current.set('multiple_faces', Date.now())
             if (multipleFacesSinceRef.current === null) multipleFacesSinceRef.current = Date.now()
 
             if (Date.now() - multipleFacesSinceRef.current >= MULTIPLE_FACES_THRESHOLD_MS && !currentDetection) {
@@ -1555,12 +1588,13 @@ export default function App() {
                 return prev
               })
               activeMultipleFacesViolationRef.current = null
-              resetEventDetectionCount('multiple_faces') // Reset detection count when violation ends
+              // Episode close deferred to the EPISODE_GAP_MS sweep.
             }
           }
 
           // Check for face not visible (time-based; only if nothing higher-priority detected)
           if (faceCount === 0 && !currentDetection) {
+            lastSeenRef.current.set('face_not_visible', Date.now())
             if (faceNotVisibleSinceRef.current === null) faceNotVisibleSinceRef.current = Date.now()
 
             if (Date.now() - faceNotVisibleSinceRef.current >= FACE_NOT_VISIBLE_THRESHOLD_MS) {
@@ -1594,7 +1628,7 @@ export default function App() {
                 return prev
               })
               activeFaceNotVisibleViolationRef.current = null
-              resetEventDetectionCount('face_not_visible') // Reset detection count when violation ends
+              // Episode close deferred to the EPISODE_GAP_MS sweep.
             }
           }
 
@@ -1621,7 +1655,7 @@ export default function App() {
                 return prev
               })
               activeCellPhoneViolationRef.current = null
-              resetEventDetectionCount('cell_phone') // Reset detection count when violation ends
+              // Episode close deferred to the EPISODE_GAP_MS sweep.
             }
 
             detectionCountRef.current.type = cellPhoneDetection
@@ -1699,6 +1733,7 @@ export default function App() {
         const detectionTime = new Date()
         detectionCountRef.current = { type: 'tab_switch', count: 1 }
         latestDetectionScoreRef.current = { type: 'tab_switch', score: 1 }
+        lastSeenRef.current.set('tab_switch', Date.now())
         
         // Add violation
         addViolation('tab_switch')
@@ -1727,7 +1762,7 @@ export default function App() {
         })
         activeTabSwitchViolationRef.current = null
         detectionCountRef.current = { type: null, count: 0 }
-        resetEventDetectionCount('tab_switch') // Reset detection count when violation ends
+        // Episode close deferred to the EPISODE_GAP_MS sweep.
       }
     }
 
@@ -1790,6 +1825,9 @@ export default function App() {
     // Only act while an exam is in progress (mirrors the other detections).
     if (!isExamActiveRef.current) return
 
+    // Keep the wrong-face episode alive while the mismatch persists.
+    lastSeenRef.current.set('wrong_face', Date.now())
+
     // Start the 10-second violation recording (deduped per type while active).
     const streamToUse = getMediaStream()
     if (streamToUse) {
@@ -1820,8 +1858,8 @@ export default function App() {
       return prev
     })
     activeWrongFaceViolationRef.current = null
-    resetEventDetectionCount('wrong_face')
-  }, [resetEventDetectionCount])
+    // Episode close deferred to the EPISODE_GAP_MS sweep.
+  }, [])
 
   useFaceProctoring({
     sessionId: proctorSessionId,
@@ -1904,6 +1942,7 @@ export default function App() {
       // Clear cooldown windows on unmount
       lastEventSentRef.current.clear()
       lastVideoUploadRef.current.clear()
+      lastSeenRef.current.clear()
       
       // Stop all media stream tracks
       if (mediaStreamRef.current) {
