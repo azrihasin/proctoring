@@ -1964,7 +1964,10 @@ export default function App() {
   // }
 
   return (
-    <div className="min-h-screen bg-slate-50 p-4">
+    // Downscale the entire app uniformly (layout + fonts) since it is embedded
+    // in a small ~1/3 x 1/3 viewport the candidate never directly sees. `zoom`
+    // scales width, height and font sizes together; tune the value to taste.
+    <div className="min-h-screen bg-slate-50 p-4" style={{ zoom: 0.5 }}>
       <div className="max-w-7xl mx-auto space-y-4">
         {/* Header */}
         <div className="text-center">
@@ -2007,7 +2010,7 @@ export default function App() {
           {/* Video Feed - Takes 2 columns */}
           <Card className="bg-orange-50 border-orange-200 lg:col-span-2">
             <CardContent className="p-0">
-              <div className="relative w-full max-w-sm mx-auto aspect-video bg-black rounded-lg overflow-hidden">
+              <div className="relative w-full aspect-video bg-black rounded-lg overflow-hidden">
                 {webcamError ? (
                   <div className="w-full h-full flex flex-col items-center justify-center text-white p-4">
                     <p className="text-lg font-semibold mb-2">Camera Access Error</p>
