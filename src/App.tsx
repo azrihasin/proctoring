@@ -1965,9 +1965,21 @@ export default function App() {
 
   return (
     // Downscale the entire app uniformly (layout + fonts) since it is embedded
-    // in a small ~1/3 x 1/3 viewport the candidate never directly sees. `zoom`
-    // scales width, height and font sizes together; tune the value to taste.
-    <div className="min-h-screen bg-slate-50 p-4" style={{ zoom: 0.5 }}>
+    // in a small ~1/3 x 1/3 viewport the candidate never directly sees.
+    // `zoom` is non-standard and silently ignored in some browsers/webviews
+    // (so it "only worked on localhost"). `transform: scale()` is the
+    // cross-browser equivalent, but it does not shrink the layout box, so we
+    // widen/heighten the element by 1/scale (here 200% for scale 0.5) so the
+    // scaled content still fills the viewport. Tune SCALE to taste.
+    <div
+      className="min-h-screen bg-slate-50 p-4"
+      style={{
+        transform: 'scale(0.5)',
+        transformOrigin: 'top left',
+        width: '200%',
+        height: '200%',
+      }}
+    >
       <div className="max-w-7xl mx-auto space-y-4">
         {/* Header */}
         <div className="text-center">
