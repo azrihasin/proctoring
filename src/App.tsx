@@ -1,5 +1,5 @@
 import { useRef, useState, useEffect, useCallback } from 'react'
-import { FaceDetector, ObjectDetector, FilesetResolver } from '@mediapipe/tasks-vision'
+import { FaceDetector, FilesetResolver } from '@mediapipe/tasks-vision'
 import Webcam from 'react-webcam'
 import { useReactMediaRecorder } from 'react-media-recorder'
 import { Button } from '@/components/ui/button'
@@ -9,16 +9,12 @@ import { fixWebmMetadata } from '@/lib/utils'
 import { Eye, EyeOff, Layers, Square } from 'lucide-react'
 import axios from 'axios'
 import { useFaceProctoring } from '@/proctoring/useFaceProctoring'
+import { usePhoneUsageDetection } from '@/proctoring/phone/usePhoneUsageDetection'
+import { renderPhoneOverlay, type OverlaySnapshot } from '@/proctoring/phone/overlay'
+import type { PhoneEvidence } from '@/proctoring/phone/types'
 // import EKYC from '@/components/EKYC'
 
 type DetectionType = 'cell_phone' | 'multiple_faces' | 'face_not_visible' | 'tab_switch' | 'wrong_face' | null
-
-type DetectionHistoryEntry = {
-  type: DetectionType
-  timestamp: Date
-  score?: number
-  videoBlob?: Blob
-}
 
 type ViolationEntry = {
   type: DetectionType
@@ -90,13 +86,8 @@ export default function App() {
   const isDetectingRef = useRef<boolean>(false) // Guard against overlapping detection cycles
   const lastTimingLogRef = useRef<number>(0) // Throttle for frame-timing diagnostics
   const faceDetectorRef = useRef<FaceDetector | null>(null)
-  const objectDetectorRef = useRef<ObjectDetector | null>(null)
   const detectionIntervalRef = useRef<number | null>(null) // Store interval ID for detection
-  
-  const cellPhoneDetectionDebounceRef = useRef<number | null>(null) // For debounce
-  const lastCellPhoneDetectionTimeRef = useRef<number>(0)
   const latestDetectionScoreRef = useRef<{ type: DetectionType; score: number } | null>(null) // Store latest detection score for violations
-  const [detectionHistory, setDetectionHistory] = useState<DetectionHistoryEntry[]>([])
   const activeFaceNotVisibleViolationRef = useRef<number | null>(null) // Index of active face_not_visible violation in violations array
   const activeCellPhoneViolationRef = useRef<number | null>(null) // Index of active cell_phone violation in violations array
   const activeMultipleFacesViolationRef = useRef<number | null>(null) // Index of active multiple_faces violation in violations array
@@ -111,8 +102,11 @@ export default function App() {
   const [proctorSessionId, setProctorSessionId] = useState<string | null>(null)
   // Live, human-readable status of the wrong-face checker (shown on-screen so the
   // failure point is visible without opening the browser console).
-  const [faceProctoringStatus, setFaceProctoringStatus] = useState<string>('Wrong-face check: initializing…')
-  
+  const [, setFaceProctoringStatus] = useState<string>('Wrong-face check: initializing…')
+  // Live, human-readable status of the two-step cell-phone checker (object
+  // detector candidate -> image classifier confirmation).
+  const [, setPhoneCheckStatus] = useState<string>('Phone check: initializing…')
+
   // User ID from URL parameters
   const userIdRef = useRef<string | null>(null)
   
@@ -1235,21 +1229,11 @@ export default function App() {
       })
       
       faceDetectorRef.current = faceDetector
-      
-      // Load Object Detector for smartphone detection
-      const objectDetector = await ObjectDetector.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
-          delegate: 'GPU'
-        },
-        runningMode: 'VIDEO',
-        scoreThreshold: 0.42, // Set to 42% for smooth cell phone detection
-        maxResults: 10 // Increased to see more detections
-        // Removed categoryAllowlist to detect all objects and filter manually
-      })
-      
-      objectDetectorRef.current = objectDetector
-      
+
+      // NOTE: cell-phone detection no longer lives here. It runs in the dedicated
+      // usePhoneUsageDetection hook (object-detector candidate + MediaPipe
+      // rule-engine confirmation), so this loop only handles faces.
+
       setModelsLoaded(true)
 
       // Start detection interval - 100ms for real-time detection (10 FPS)
@@ -1290,8 +1274,7 @@ export default function App() {
     if (
       video &&
       video.readyState === 4 &&
-      faceDetectorRef.current &&
-      objectDetectorRef.current
+      faceDetectorRef.current
     ) {
       const videoWidth = video.videoWidth
       const videoHeight = video.videoHeight
@@ -1306,11 +1289,9 @@ export default function App() {
         try {
           const startTimeMs = performance.now()
 
-          // Run MediaPipe Face Detection
+          // Run MediaPipe Face Detection (cell-phone detection runs separately
+          // in useMediaPipePhoneVerification).
           const faceResults = faceDetectorRef.current.detectForVideo(video, startTimeMs)
-
-          // Run MediaPipe Object Detection for smartphones
-          const objectResults = objectDetectorRef.current.detectForVideo(video, startTimeMs)
 
           // Throttled frame-timing diagnostics: confirm whether the ~100ms
           // detection loop budget is actually being met (logged at most once
@@ -1366,190 +1347,39 @@ export default function App() {
               }
             })
 
-            // Draw object detections - ONLY cell phones
-            if (objectResults.detections && objectResults.detections.length > 0) {
-              objectResults.detections.forEach((detection) => {
-                if (!detection.categories || detection.categories.length === 0) return
-                
-                const category = detection.categories[0]
-                const categoryName = category.categoryName || ''
-                const categoryLower = categoryName.toLowerCase()
-                
-                // Check if this is a cell phone or phone-related object
-                const isCellPhone = categoryLower.includes('cell phone') || 
-                                   categoryLower.includes('phone') ||
-                                   categoryLower.includes('mobile') ||
-                                   categoryLower === 'cell phone'
-                
-                // ONLY draw and process cell phones with 42% or more confidence - ignore all other objects
-                if (!isCellPhone || category.score < 0.42) return
-                
-                const bbox = detection.boundingBox
-                if (bbox) {
-                  const x = bbox.originX
-                  const y = bbox.originY
-                  const width = bbox.width
-                  const height = bbox.height
-                  
-                  // Draw cell phone with magenta color
-                  const boxColor = '#ff00ff' // Magenta for phones
-                  
-                  // Draw bounding box
-                  ctx.strokeStyle = boxColor
-                  ctx.lineWidth = 4
-                  ctx.strokeRect(x, y, width, height)
-                  
-                  // Draw label background
-                  ctx.fillStyle = boxColor
-                  const labelWidth = Math.max(200, categoryName.length * 10)
-                  ctx.fillRect(x, y - 25, labelWidth, 25)
-                  
-                  // Draw label text
-                  ctx.fillStyle = '#ffffff'
-                  ctx.font = 'bold 16px Arial'
-                  const confidence = (category.score * 100).toFixed(1)
-                  ctx.fillText(
-                    `${categoryName} (${confidence}%)`,
-                    x + 5,
-                    y - 8
-                  )
-                }
-              })
-            }
-
-            // Display detection status at top of canvas
-            if (faceCount > 1) {
-              ctx.fillStyle = '#ff0000'
-              ctx.fillRect(10, 10, 220, 40)
-              ctx.fillStyle = '#ffffff'
-              ctx.font = 'bold 18px Arial'
-              ctx.fillText(
-                `Multiple Faces: ${faceCount}`,
-                15,
-                35
-              )
-            } else if (faceCount === 1) {
-              ctx.fillStyle = '#00ff00'
-              ctx.fillRect(10, 10, 200, 40)
-              ctx.fillStyle = '#ffffff'
-              ctx.font = 'bold 18px Arial'
-              ctx.fillText(
-                `Face Detected`,
-                15,
-                35
-              )
-            }
-            
-            // Display cell phone detection count at bottom (only count detections with >=42% confidence)
-            const cellPhoneCount = objectResults.detections ? 
-              objectResults.detections.filter(detection => {
-                if (!detection.categories || detection.categories.length === 0) return false
-                const category = detection.categories[0]
-                const categoryLower = category.categoryName.toLowerCase()
-                const isPhone = categoryLower.includes('cell phone') || 
-                               categoryLower.includes('phone') ||
-                               categoryLower.includes('mobile') ||
-                               categoryLower === 'cell phone'
-                return isPhone && category.score >= 0.42
-              }).length : 0
-            
-            if (cellPhoneCount > 0) {
-              ctx.fillStyle = 'rgba(255, 0, 255, 0.7)'
-              ctx.fillRect(10, videoHeight - 50, 250, 40)
-              ctx.fillStyle = '#ffffff'
-              ctx.font = 'bold 14px Arial'
-              ctx.fillText(
-                `Cell phones detected: ${cellPhoneCount}`,
-                15,
-                videoHeight - 25
+            // Live utility overlays for the object-detector + MediaPipe phone
+            // pipeline (drawn on the same overlay the face loop clears each
+            // frame): detector boxes (person / phone candidate / objects) with
+            // class+confidence, MediaPipe Face Mesh, Pose skeleton, hand
+            // landmarks, suspicious webcam zones and the decision banner
+            // (NO_VIOLATION / REJECTED / SUSPICIOUS / CONFIRMED). The canvas is
+            // sized to the video's pixel dims, so the renderer's normalized
+            // landmarks scale correctly.
+            const phoneSnap = phoneSnapshotRef.current
+            if (phoneSnap) {
+              // Hide the top-left decision banner (NO_VIOLATION / SUSPICIOUS
+              // PHONE CANDIDATE / etc.) in the live preview; saved evidence
+              // frames still render it for explainability.
+              const liveCfg = phoneConfigRef.current
+              renderPhoneOverlay(
+                ctx,
+                { ...liveCfg, overlay: { ...liveCfg.overlay, labelBanner: false } },
+                phoneSnap,
               )
             }
 
-          // Detection thresholds for MediaPipe
-          const REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE = 2 // 2 frames (0.2 seconds) - smooth detection with higher confidence
-          const CELL_PHONE_DEBOUNCE_MS = 800 // 0.8 seconds debounce for smoother detection
           // Time-based gating for face-count violations (frame-count gating was
           // unreliable when the loop ran slower than 100ms/frame). Near-instant
           // alerting per requirement; raise to 500-800ms if too noisy.
           const FACE_NOT_VISIBLE_THRESHOLD_MS = 150
           const MULTIPLE_FACES_THRESHOLD_MS = 150
-          
-          let currentDetection: DetectionType = null
-          
-          // Detect smartphone using object detection
-          let isCellPhoneDetected = false
-          let cellPhoneScore = 0
-          
-          if (objectResults.detections && objectResults.detections.length > 0) {
-            // Only check for cell phones - filter out all other objects
-            objectResults.detections.forEach((detection) => {
-              if (detection.categories && detection.categories.length > 0) {
-                const category = detection.categories[0]
-                const categoryLower = category.categoryName.toLowerCase()
-                
-                // Check for cell phone category (comprehensive list of possible names)
-                // COCO dataset uses "cell phone" as the category name
-                const isPhone = categoryLower === 'cell phone' ||
-                               categoryLower.includes('cell phone') || 
-                               categoryLower.includes('cellphone') ||
-                               categoryLower === 'phone' ||
-                               categoryLower === 'mobile' ||
-                               categoryLower === 'mobile phone' ||
-                               categoryLower === 'smartphone'
-                
-                // Only consider detections with 42% or more confidence for smooth detection
-                if (isPhone && category.score >= 0.42) {
-                  isCellPhoneDetected = true
-                  cellPhoneScore = Math.max(cellPhoneScore, category.score)
-                  
-                }
-              }
-            })
-          }
-          
-          // Keep the cell-phone episode alive while the phone is visible.
-          if (isCellPhoneDetected) lastSeenRef.current.set('cell_phone', Date.now())
 
-          // Set cell phone detection if phone detected
-          if (isCellPhoneDetected && !currentDetection) {
-            currentDetection = 'cell_phone'
-            latestDetectionScoreRef.current = { type: 'cell_phone', score: cellPhoneScore }
-            
-            // Add to detection history
-            setDetectionHistory(prev => {
-              const updated = [
-                ...prev,
-                {
-                  type: 'cell_phone' as DetectionType,
-                  timestamp: new Date(),
-                  score: cellPhoneScore
-                }
-              ]
-              return updated.slice(-100)
-            })
-          } else if (!isCellPhoneDetected && activeCellPhoneViolationRef.current !== null) {
-            // End cell phone violation if no longer detected (add 10 seconds after)
-            setViolations(prev => {
-              const activeIndex = activeCellPhoneViolationRef.current
-              if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'cell_phone') {
-                const updated = [...prev]
-                const currentTime = new Date()
-                updated[activeIndex] = {
-                  ...updated[activeIndex],
-                  endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
-                }
-                
-                // Violation recording stops automatically after 10 seconds from detection
-                // No need to schedule stop here
-                
-                return updated
-              }
-              return prev
-            })
-            activeCellPhoneViolationRef.current = null
-            // Episode close (resetEventDetectionCount) is deferred to the
-            // EPISODE_GAP_MS sweep so a brief dropout doesn't re-fire event/upload.
-          }
+          let currentDetection: DetectionType = null
+
+          // NOTE: cell_phone is no longer detected here. It is handled end-to-end
+          // by usePhoneUsageDetection (object-detector candidate + MediaPipe
+          // rule-engine confirmation) and routed through the same violation
+          // pipeline via the onPhoneConfirmed / onPhoneCleared handlers below.
 
           // Check for multiple faces (time-based gating, fired directly)
           if (faceCount > 1) {
@@ -1632,87 +1462,9 @@ export default function App() {
             }
           }
 
-          // Track consecutive cell-phone detections to reduce false positives.
-          // multiple_faces / face_not_visible are now fired directly above and
-          // no longer flow through this consecutive-frame debounce.
-          const cellPhoneDetection: DetectionType = currentDetection === 'cell_phone' ? 'cell_phone' : null
-          if (cellPhoneDetection === detectionCountRef.current.type) {
-            detectionCountRef.current.count++
-          } else {
-            // End active cell-phone violation if switching away (add 10 seconds after)
-            if (detectionCountRef.current.type === 'cell_phone' && activeCellPhoneViolationRef.current !== null) {
-              setViolations(prev => {
-                const activeIndex = activeCellPhoneViolationRef.current
-                if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'cell_phone') {
-                  const updated = [...prev]
-                  const currentTime = new Date()
-                  updated[activeIndex] = {
-                    ...updated[activeIndex],
-                    endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
-                  }
-                  return updated
-                }
-                return prev
-              })
-              activeCellPhoneViolationRef.current = null
-              // Episode close deferred to the EPISODE_GAP_MS sweep.
-            }
-
-            detectionCountRef.current.type = cellPhoneDetection
-            detectionCountRef.current.count = cellPhoneDetection ? 1 : 0
-          }
-
-          // Only trigger the cell-phone violation after required consecutive detections
-          const confirmedDetection = detectionCountRef.current.type
-          const hasEnoughConsecutiveDetections =
-            detectionCountRef.current.count >= REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE &&
-            confirmedDetection === 'cell_phone'
-
-          // For cell phones, also check debounce
-          let shouldTriggerAlert: boolean = hasEnoughConsecutiveDetections
-          if (confirmedDetection === 'cell_phone' && hasEnoughConsecutiveDetections) {
-            const now = Date.now()
-            const timeSinceLastDetection = now - lastCellPhoneDetectionTimeRef.current
-            shouldTriggerAlert = timeSinceLastDetection >= CELL_PHONE_DEBOUNCE_MS
-          }
-
-          if (shouldTriggerAlert && confirmedDetection === 'cell_phone') {
-            // Start violation recording automatically (will be ignored if already recording this type)
-            const streamToUse = getMediaStream()
-            const examIsActive = isExamActiveRef.current || isExamActive // Check both ref and state
-
-            if (examIsActive && streamToUse) {
-              const detectionTime = new Date()
-              // Fire and forget - violation recording runs in background
-              // startViolationRecording will ignore if same type is already recording
-              startViolationRecording(streamToUse, detectionTime, 'cell_phone').catch((error) => {
-                console.error('Error starting violation recording:', error)
-              })
-            }
-            lastCellPhoneDetectionTimeRef.current = Date.now()
-
-            const violationScore = latestDetectionScoreRef.current?.type === 'cell_phone'
-              ? latestDetectionScoreRef.current.score
-              : undefined
-            addViolation('cell_phone', violationScore)
-          } else if (confirmedDetection === 'cell_phone' && activeCellPhoneViolationRef.current !== null) {
-            setViolations(prev => {
-              const activeIndex = activeCellPhoneViolationRef.current
-              if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'cell_phone') {
-                const updated = [...prev]
-                const currentTime = new Date()
-                updated[activeIndex] = {
-                  ...updated[activeIndex],
-                  endTime: new Date(currentTime.getTime() + 10000), // +10 seconds after detection ends
-                  score: latestDetectionScoreRef.current?.type === 'cell_phone'
-                    ? latestDetectionScoreRef.current.score
-                    : updated[activeIndex].score
-                }
-                return updated
-              }
-              return prev
-            })
-          }
+          // cell_phone consecutive-frame gating + triggering has moved into
+          // usePhoneUsageDetection (detector candidate + rule-engine confirmation).
+          void currentDetection
           } // Close ctx if statement
         } catch (error) {
           console.error('Error during MediaPipe detection:', error)
@@ -1787,11 +1539,6 @@ export default function App() {
     }
   }, [addViolation, getMediaStream, startViolationRecording])
 
-
-  // Log detection history changes (for debugging/maintenance)
-  useEffect(() => {
-    // Removed console.log statements
-  }, [detectionHistory])
 
   // Auto-start exam when webcam and models are both ready
   useEffect(() => {
@@ -1868,6 +1615,84 @@ export default function App() {
     onStatus: setFaceProctoringStatus,
   })
 
+  // Cell-phone detection: two-step MediaPipe pipeline (Object Detector candidate
+  // -> Image Classifier confirmation). Fires the SAME cell_phone violation as
+  // before, routed through the existing recording/event/upload pipeline. Confirms
+  // are delivered on every detection tick so duration + cooldown behave exactly
+  // like the other per-frame violations.
+  const handlePhoneConfirmed = useCallback((confidence: number) => {
+    if (!isExamActiveRef.current) return
+
+    // Keep the cell-phone episode alive while the phone is confirmed.
+    lastSeenRef.current.set('cell_phone', Date.now())
+
+    // Start the 10s violation recording (deduped per type while active).
+    const streamToUse = getMediaStream()
+    if (streamToUse) {
+      startViolationRecording(streamToUse, new Date(), 'cell_phone').catch((error) => {
+        console.error('Error starting cell phone violation recording:', error)
+      })
+    }
+
+    // Log + send event (addViolation throttles repeats and updates duration).
+    addViolation('cell_phone', confidence)
+  }, [getMediaStream, startViolationRecording, addViolation])
+
+  const handlePhoneCleared = useCallback(() => {
+    if (activeCellPhoneViolationRef.current === null) return
+    // Phone no longer confirmed — close out the active violation (+10s).
+    setViolations(prev => {
+      const activeIndex = activeCellPhoneViolationRef.current
+      if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'cell_phone') {
+        const updated = [...prev]
+        const currentTime = new Date()
+        updated[activeIndex] = {
+          ...updated[activeIndex],
+          endTime: new Date(currentTime.getTime() + 10000),
+        }
+        return updated
+      }
+      return prev
+    })
+    activeCellPhoneViolationRef.current = null
+    // Episode close deferred to the EPISODE_GAP_MS sweep.
+  }, [])
+
+  // Explainable evidence for a CONFIRMED_PHONE_USAGE violation: raw frame,
+  // annotated frame (detector boxes + Face Mesh + pose + hands + zones) and a JSON
+  // metadata record (gates that passed + reason list). Logged always; the image
+  // + JSON bundle is downloaded while an exam is in progress.
+  const handlePhoneEvidence = useCallback((evidence: PhoneEvidence) => {
+    console.log('📸 CONFIRMED_PHONE_USAGE evidence:', evidence.meta)
+  }, [])
+
+  // Mirror the latest overlay snapshot into a ref so the MediaPipe canvas loop
+  // (which owns and clears the overlay each frame) can render every utility
+  // overlay without re-subscribing.
+  const phoneSnapshotRef = useRef<OverlaySnapshot | null>(null)
+
+  const {
+    config: phoneConfig,
+  } = usePhoneUsageDetection({
+    // Run the detection pipeline whenever the webcam is live (not tied to exam
+    // state) so the live overlays + labels are visible for testing. The actual
+    // cell_phone VIOLATION recording is still gated on an active exam inside
+    // handlePhoneConfirmed — and only CONFIRMED_PHONE_USAGE ever fires it.
+    enabled: webcamReady,
+    sessionId: proctorSessionId,
+    studentId: sessionIdDisplay,
+    onFrame: (snap) => { phoneSnapshotRef.current = snap },
+    onConfirmed: (confidence) => handlePhoneConfirmed(confidence),
+    onCleared: handlePhoneCleared,
+    onEvidence: handlePhoneEvidence,
+    onStatus: setPhoneCheckStatus,
+  })
+
+  // Keep the resolved pipeline config reachable from the (mount-captured) canvas
+  // loop closure via a stable ref.
+  const phoneConfigRef = useRef(phoneConfig)
+  useEffect(() => { phoneConfigRef.current = phoneConfig }, [phoneConfig])
+
   useEffect(() => {
     loadMediaPipeModels()
 
@@ -1881,21 +1706,12 @@ export default function App() {
         clearTimeout(recordingTimeoutRef.current)
         recordingTimeoutRef.current = null
       }
-      if (cellPhoneDetectionDebounceRef.current) {
-        clearTimeout(cellPhoneDetectionDebounceRef.current)
-        cellPhoneDetectionDebounceRef.current = null
-      }
-      
       // Clean up MediaPipe detectors
       if (faceDetectorRef.current) {
         faceDetectorRef.current.close()
         faceDetectorRef.current = null
       }
-      if (objectDetectorRef.current) {
-        objectDetectorRef.current.close()
-        objectDetectorRef.current = null
-      }
-      
+
       // Stop exam recording if active (using react-media-recorder)
       if (examRecordingStatus === 'recording') {
         stopExamRecording()
@@ -2074,18 +1890,6 @@ export default function App() {
                   <h2 className="text-lg font-bold text-gray-900">Log Section</h2>
                   <div className="text-xs text-gray-600 bg-gray-100 px-3 py-1.5 rounded-md border border-gray-300">
                     <span className="font-semibold text-gray-700">Session ID:</span> {sessionIdDisplay || 'No Session ID'}
-                  </div>
-                  <div
-                    className={`text-xs px-3 py-1.5 rounded-md border ${
-                      faceProctoringStatus.includes('DISABLED') || faceProctoringStatus.includes('FAILED')
-                        ? 'text-red-700 bg-red-50 border-red-300'
-                        : faceProctoringStatus.includes('mismatch')
-                        ? 'text-orange-700 bg-orange-50 border-orange-300'
-                        : 'text-gray-600 bg-gray-100 border-gray-300'
-                    }`}
-                    title="Live status of the wrong-face (KYC mismatch) checker"
-                  >
-                    {faceProctoringStatus}
                   </div>
                 </div>
                 <Button
