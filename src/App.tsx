@@ -3,10 +3,12 @@ import { FaceDetector, ObjectDetector, FaceLandmarker, DrawingUtils, FilesetReso
 import Webcam from 'react-webcam'
 import { useReactMediaRecorder } from 'react-media-recorder'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent } from '@/components/ui/card'
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Textarea } from '@/components/ui/textarea'
+import { Badge } from '@/components/ui/badge'
+import { VideoPreview } from '@/components/VideoPreview'
 import { fixWebmMetadata } from '@/lib/utils'
-import { Eye, EyeOff, Layers, Square } from 'lucide-react'
+import { Eye, EyeOff, Layers, Square, Download } from 'lucide-react'
 import axios from 'axios'
 import { useFaceProctoring } from '@/proctoring/useFaceProctoring'
 // import EKYC from '@/components/EKYC'
@@ -2384,7 +2386,7 @@ export default function App() {
     // widen/heighten the element by 1/scale (here 200% for scale 0.5) so the
     // scaled content still fills the viewport. Tune SCALE to taste.
     <div
-      className="min-h-screen bg-slate-50 p-4"
+      className="min-h-screen bg-muted/40 p-4"
       style={{
         transform: 'scale(0.5)',
         transformOrigin: 'top left',
@@ -2395,7 +2397,7 @@ export default function App() {
       <div className="max-w-7xl mx-auto space-y-4">
         {/* Header */}
         <div className="text-center">
-          <h1 className="text-3xl font-bold text-gray-900">
+          <h1 className="text-3xl font-bold text-foreground">
             {' '}
           </h1>
         </div>
@@ -2405,12 +2407,10 @@ export default function App() {
           <Button
             onClick={isExamActive ? handleEndExam : handleStartExam}
             disabled={!webcamReady || !modelsLoaded}
+            variant={isExamActive ? 'destructive' : 'default'}
+            size="lg"
             style={{ display: 'none' }}
-            className={`font-semibold px-8 py-3 ${
-              isExamActive
-                ? 'bg-red-600 hover:bg-red-700 text-white'
-                : 'bg-green-600 hover:bg-green-700 text-white'
-            }`}
+            className="font-semibold"
           >
             {isExamActive ? 'TAMAT PEPERIKSAAN' : 'MULA PEPERIKSAAN'}
           </Button>
@@ -2418,7 +2418,6 @@ export default function App() {
             onClick={() => setIsViewVisible(!isViewVisible)}
             variant="ghost"
             size="icon"
-            className="bg-transparent hover:bg-transparent text-current hover:text-current border-none shadow-none cursor-pointer"
             title={isViewVisible ? 'Hide view' : 'Show view'}
           >
             {isViewVisible ? (
@@ -2432,9 +2431,9 @@ export default function App() {
         {/* Video Feed and Log Section - Side by Side */}
         <div className={`grid grid-cols-1 lg:grid-cols-3 gap-4 ${!isViewVisible ? 'hidden' : ''}`}>
           {/* Video Feed - Takes 2 columns */}
-          <Card className="bg-orange-50 border-orange-200 lg:col-span-2">
+          <Card className="lg:col-span-2 overflow-hidden">
             <CardContent className="p-0">
-              <div className="relative w-full aspect-video bg-black rounded-lg overflow-hidden">
+              <div className="relative w-full aspect-video bg-black overflow-hidden">
                 {webcamError ? (
                   <div className="w-full h-full flex flex-col items-center justify-center text-white p-4">
                     <p className="text-lg font-semibold mb-2">Camera Access Error</p>
@@ -2479,47 +2478,45 @@ export default function App() {
           </Card>
 
           {/* Log Section - Takes 1 column */}
-          <Card className="border-green-200 flex flex-col">
-            <div className="bg-green-100 rounded-t-lg p-3 border-b border-green-200">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-3">
-                  <h2 className="text-lg font-bold text-gray-900">Log Section</h2>
-                  <div className="text-xs text-gray-600 bg-gray-100 px-3 py-1.5 rounded-md border border-gray-300">
-                    <span className="font-semibold text-gray-700">Session ID:</span> {sessionIdDisplay || 'No Session ID'}
-                  </div>
-                  <div
-                    className={`text-xs px-3 py-1.5 rounded-md border ${
-                      faceProctoringStatus.includes('DISABLED') || faceProctoringStatus.includes('FAILED')
-                        ? 'text-red-700 bg-red-50 border-red-300'
-                        : faceProctoringStatus.includes('mismatch')
-                        ? 'text-orange-700 bg-orange-50 border-orange-300'
-                        : 'text-gray-600 bg-gray-100 border-gray-300'
-                    }`}
-                    title="Live status of the wrong-face (KYC mismatch) checker"
-                  >
-                    {faceProctoringStatus}
-                  </div>
-                </div>
-                <Button
-                  onClick={() => setIsOverlayEnabled(!isOverlayEnabled)}
-                  size="icon"
-                  className="bg-teal-600 hover:bg-teal-700 text-white"
-                  title={isOverlayEnabled ? 'Disable Overlay' : 'Enable Overlay'}
+          <Card className="flex flex-col">
+            <CardHeader className="flex-row items-center justify-between gap-2 space-y-0 border-b py-3 bg-muted rounded-t-lg">
+              <div className="flex items-center gap-2 flex-wrap">
+                <CardTitle className="text-lg">Log Section</CardTitle>
+                <Badge variant="secondary" className="font-normal">
+                  <span className="font-semibold mr-1">Session ID:</span>
+                  {sessionIdDisplay || 'No Session ID'}
+                </Badge>
+                <Badge
+                  variant={
+                    faceProctoringStatus.includes('DISABLED') || faceProctoringStatus.includes('FAILED')
+                      ? 'destructive'
+                      : 'secondary'
+                  }
+                  className="font-normal"
+                  title="Live status of the wrong-face (KYC mismatch) checker"
                 >
-                  {isOverlayEnabled ? (
-                    <Layers className="w-5 h-5" />
-                  ) : (
-                    <Square className="w-5 h-5" />
-                  )}
-                </Button>
+                  {faceProctoringStatus}
+                </Badge>
               </div>
-            </div>
+              <Button
+                onClick={() => setIsOverlayEnabled(!isOverlayEnabled)}
+                variant={isOverlayEnabled ? 'default' : 'secondary'}
+                size="icon"
+                title={isOverlayEnabled ? 'Disable Overlay' : 'Enable Overlay'}
+              >
+                {isOverlayEnabled ? (
+                  <Layers className="w-5 h-5" />
+                ) : (
+                  <Square className="w-5 h-5" />
+                )}
+              </Button>
+            </CardHeader>
             <CardContent className="p-4 flex-1 flex flex-col">
               <Textarea
                 ref={logSectionRef}
                 readOnly
                 value={logEntries.join('\n')}
-                className="h-full bg-white border-gray-300 font-mono text-xs overflow-y-auto"
+                className="h-full font-mono text-xs overflow-y-auto"
                 placeholder="Log entries will appear here..."
               />
             </CardContent>
@@ -2529,48 +2526,53 @@ export default function App() {
         {/* Status Messages */}
         {!modelsLoaded && (
           <div className="text-center">
-            <p className="text-blue-600 font-semibold">Loading detection models...</p>
+            <p className="text-primary font-semibold">Loading detection models...</p>
           </div>
         )}
 
         {/* Recording Timer - Inside show/hide section */}
         {isViewVisible && isExamActive && examStartTime && (
-          <div className="text-center bg-green-50 border border-green-200 rounded-lg p-4">
-            <div className="flex items-center justify-center gap-3">
-              <div className="flex items-center gap-2">
-                <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse"></div>
-                <p className="text-green-700 font-semibold text-lg">Recording in progress</p>
+          <Card>
+            <CardContent className="p-4 text-center">
+              <div className="flex items-center justify-center gap-3">
+                <div className="flex items-center gap-2">
+                  <div className="w-3 h-3 bg-destructive rounded-full animate-pulse"></div>
+                  <p className="font-semibold text-lg">Recording in progress</p>
+                </div>
+                <div className="font-mono text-xl font-bold tabular-nums">
+                  {Math.floor(recordingDuration / 3600).toString().padStart(2, '0')}:
+                  {Math.floor((recordingDuration % 3600) / 60).toString().padStart(2, '0')}:
+                  {(recordingDuration % 60).toString().padStart(2, '0')}
+                </div>
               </div>
-              <div className="text-green-600 font-mono text-xl font-bold">
-                {Math.floor(recordingDuration / 3600).toString().padStart(2, '0')}:
-                {Math.floor((recordingDuration % 3600) / 60).toString().padStart(2, '0')}:
-                {(recordingDuration % 60).toString().padStart(2, '0')}
-              </div>
-            </div>
-            <p className="text-sm text-green-600 mt-1">
-              Started at {examStartTime.toLocaleTimeString()}
-            </p>
-          </div>
+              <p className="text-sm text-muted-foreground mt-1">
+                Started at {examStartTime.toLocaleTimeString()}
+              </p>
+            </CardContent>
+          </Card>
         )}
 
         {/* Recorded Videos List */}
         {isViewVisible && (
-          <Card className="border-blue-200">
-            <div className="bg-blue-100 rounded-t-lg p-3 border-b border-blue-200">
-              <h2 className="text-lg font-bold text-gray-900">Recorded Videos</h2>
-              <p className="text-sm text-gray-600 mt-1">
-                {recordedVideos.length > 0 
+          <Card>
+            <CardHeader className="border-b py-3 bg-muted rounded-t-lg">
+              <CardTitle className="text-lg">Recorded Videos</CardTitle>
+              <CardDescription>
+                {recordedVideos.length > 0
                   ? `${recordedVideos.length} video${recordedVideos.length > 1 ? 's' : ''} recorded`
                   : 'No videos recorded yet'}
-              </p>
-            </div>
+              </CardDescription>
+            </CardHeader>
             <CardContent className="p-4">
               {recordedVideos.length === 0 ? (
-                <div className="min-h-[100px] bg-white border border-gray-300 rounded-md flex items-center justify-center">
-                  <p className="text-gray-500 text-sm">Videos will appear here after recording</p>
+                <div className="min-h-[100px] border rounded-md flex items-center justify-center">
+                  <p className="text-muted-foreground text-sm">Videos will appear here after recording</p>
                 </div>
               ) : (
-                <div ref={recordingListRef} className="space-y-2 max-h-[400px] overflow-y-auto">
+                <div
+                  ref={recordingListRef}
+                  className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 max-h-[520px] overflow-y-auto"
+                >
                   {recordedVideos.map((video) => {
                     // Estimated progress (0-100) for clips still being recorded.
                     const elapsed = video.recordingStartedAt ? nowTick - video.recordingStartedAt : 0
@@ -2585,94 +2587,93 @@ export default function App() {
                     return (
                     <div
                       key={video.id}
-                      className="bg-white border border-gray-300 rounded-md p-3 flex items-center justify-between hover:bg-gray-50 transition-colors"
+                      className="border rounded-lg p-2 flex flex-col gap-2 bg-card hover:bg-accent/40 transition-colors"
                     >
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
-                          <span
-                            className={`px-2 py-1 rounded text-xs font-semibold ${
-                              video.type === 'exam'
-                                ? 'bg-green-100 text-green-800'
-                                : 'bg-red-100 text-red-800'
-                            }`}
-                          >
-                            {video.type === 'exam' ? 'Exam' : 'Violation'}
-                          </span>
-                          <span
-                            className={`px-2 py-1 rounded text-xs font-semibold ${
-                              video.converted
-                                ? 'bg-blue-100 text-blue-800'
-                                : 'bg-yellow-100 text-yellow-800'
-                            }`}
-                          >
-                            {video.ext.toUpperCase()}
-                          </span>
-                          {video.status === 'pending' && (
-                            <span className="px-2 py-1 rounded text-xs font-semibold bg-amber-100 text-amber-800 inline-flex items-center gap-1">
-                              <span className="w-2 h-2 bg-amber-500 rounded-full animate-pulse"></span>
-                              Pending
-                            </span>
-                          )}
-                          {video.status === 'ready' && (
-                            <span className="px-2 py-1 rounded text-xs font-semibold bg-emerald-100 text-emerald-800">
-                              Ready
-                            </span>
-                          )}
-                          {video.status === 'failed' && (
-                            <span className="px-2 py-1 rounded text-xs font-semibold bg-gray-200 text-gray-700">
-                              Failed
-                            </span>
+                      {/* Inline video preview (fills the grid cell) */}
+                      {video.status === 'ready' && video.blob ? (
+                        <VideoPreview blob={video.blob} />
+                      ) : (
+                        <div className="w-full aspect-video rounded-md bg-muted flex items-center justify-center">
+                          {video.status === 'pending' ? (
+                            <span className="w-2.5 h-2.5 bg-amber-500 rounded-full animate-pulse" />
+                          ) : (
+                            <span className="text-xs text-muted-foreground">No preview</span>
                           )}
                         </div>
-                        <p className="text-sm font-medium text-gray-900 truncate">{video.filename}</p>
-                        {video.status === 'pending' ? (
-                          <div className="mt-2">
-                            <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
-                              <div
-                                className="h-full bg-amber-500 transition-all duration-200 ease-linear"
-                                style={{ width: `${progress}%` }}
-                              ></div>
-                            </div>
-                            <div className="flex items-center justify-between mt-1 text-xs text-gray-500">
-                              <span>Recording… {progress}%</span>
-                              <span>~{remainingSec}s left</span>
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="flex items-center gap-4 mt-1 text-xs text-gray-500">
-                            <span>
-                              {video.timestamp.toLocaleString('en-US', {
-                                month: '2-digit',
-                                day: '2-digit',
-                                year: 'numeric',
-                                hour: '2-digit',
-                                minute: '2-digit',
-                                second: '2-digit',
-                                hour12: true
-                              })}
-                            </span>
-                            {video.status === 'ready' && (
-                              <span>
-                                {(video.size / (1024 * 1024)).toFixed(2)} MB
-                              </span>
-                            )}
-                          </div>
+                      )}
+
+                      {/* Badges */}
+                      <div className="flex items-center gap-1 flex-wrap">
+                        <Badge variant={video.type === 'exam' ? 'default' : 'destructive'}>
+                          {video.type === 'exam' ? 'Exam' : 'Violation'}
+                        </Badge>
+                        <Badge variant="outline">{video.ext.toUpperCase()}</Badge>
+                        {video.status === 'pending' && (
+                          <Badge variant="outline" className="gap-1">
+                            <span className="w-2 h-2 bg-amber-500 rounded-full animate-pulse" />
+                            Pending
+                          </Badge>
+                        )}
+                        {video.status === 'ready' && <Badge variant="secondary">Ready</Badge>}
+                        {video.status === 'failed' && (
+                          <Badge variant="outline" className="text-muted-foreground">Failed</Badge>
                         )}
                       </div>
-                      <div className="ml-4 flex gap-2">
-                        <Button
-                          type="button"
-                          disabled={video.status !== 'ready'}
-                          onClick={(e) => {
-                            e.preventDefault()
-                            e.stopPropagation()
-                            downloadVideo(video)
-                          }}
-                          className="bg-teal-600 hover:bg-teal-700 text-white font-semibold px-4 py-2 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                          {video.status === 'pending' ? 'Recording…' : 'Download'}
-                        </Button>
-                      </div>
+
+                      {/* Filename */}
+                      <p className="text-xs font-medium truncate" title={video.filename}>
+                        {video.filename}
+                      </p>
+
+                      {/* Progress (pending) or meta (ready/failed) */}
+                      {video.status === 'pending' ? (
+                        <div>
+                          <div className="w-full h-2 bg-muted rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-amber-500 transition-all duration-200 ease-linear"
+                              style={{ width: `${progress}%` }}
+                            ></div>
+                          </div>
+                          <div className="flex items-center justify-between mt-1 text-[11px] text-muted-foreground">
+                            <span>Recording… {progress}%</span>
+                            <span>~{remainingSec}s left</span>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="flex flex-col gap-0.5 text-[11px] text-muted-foreground">
+                          <span>
+                            {video.timestamp.toLocaleString('en-US', {
+                              month: '2-digit',
+                              day: '2-digit',
+                              year: 'numeric',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                              second: '2-digit',
+                              hour12: true
+                            })}
+                          </span>
+                          {video.status === 'ready' && (
+                            <span>{(video.size / (1024 * 1024)).toFixed(2)} MB</span>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Download button */}
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="secondary"
+                        disabled={video.status !== 'ready'}
+                        onClick={(e) => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          downloadVideo(video)
+                        }}
+                        className="w-full mt-auto"
+                      >
+                        <Download className="w-4 h-4" />
+                        {video.status === 'pending' ? 'Recording…' : 'Download'}
+                      </Button>
                     </div>
                     )
                   })}
