@@ -1,5 +1,5 @@
 import { useRef, useState, useEffect, useCallback } from 'react'
-import { FaceDetector, ObjectDetector, FilesetResolver } from '@mediapipe/tasks-vision'
+import { FaceDetector, ObjectDetector, FaceLandmarker, DrawingUtils, FilesetResolver } from '@mediapipe/tasks-vision'
 import Webcam from 'react-webcam'
 import { useReactMediaRecorder } from 'react-media-recorder'
 import { Button } from '@/components/ui/button'
@@ -11,7 +11,7 @@ import axios from 'axios'
 import { useFaceProctoring } from '@/proctoring/useFaceProctoring'
 // import EKYC from '@/components/EKYC'
 
-type DetectionType = 'cell_phone' | 'multiple_faces' | 'face_not_visible' | 'tab_switch' | 'wrong_face' | null
+type DetectionType = 'cell_phone' | 'multiple_faces' | 'face_not_visible' | 'tab_switch' | 'wrong_face' | 'eyes_off_screen' | null
 
 type DetectionHistoryEntry = {
   type: DetectionType
@@ -87,10 +87,27 @@ export default function App() {
   const detectionCountRef = useRef<{ type: DetectionType; count: number }>({ type: null, count: 0 })
   const faceNotVisibleSinceRef = useRef<number | null>(null) // Timestamp when face first became not visible
   const multipleFacesSinceRef = useRef<number | null>(null) // Timestamp when multiple faces first appeared
+  const eyesOffScreenSinceRef = useRef<number | null>(null) // Timestamp when the candidate first looked away
+  const eyesOnGraceStartRef = useRef<number | null>(null) // First moment of continuous on-screen/no-face evidence; the look-away hold only resets after this persists (flicker tolerance)
+  const noSingleFaceSinceRef = useRef<number | null>(null) // First moment faceCount stopped being exactly 1; baseline only drops after a sustained absence
+  // Learned sign of the head-pitch axis. The transformation-matrix pitch sign
+  // is camera-dependent, but eye gaze (blendshapes) is anatomically fixed, and
+  // head + eyes move the SAME way during vertical glances — so accumulated
+  // sign-agreement between the two tells us the camera's convention. Negative
+  // evidence = pitch is inverted on this camera. Kept for the whole session.
+  const pitchSignEvidenceRef = useRef<number>(0)
+  // Auto-calibrated "resting posture" baseline (headYaw/pitch + gazeH/gazeV).
+  // eyes_off_screen is scored as DEVIATION from this baseline, not absolute
+  // angles, so a laptop camera sitting below the screen (looking at the screen
+  // = looking down) doesn't read as a permanent look-away. Slowly EMA-updated
+  // only while the candidate is clearly on-screen, so a real look-away never
+  // pulls the baseline toward itself.
+  const gazeBaselineRef = useRef<{ yaw: number; pitch: number; gazeH: number; gazeV: number } | null>(null)
   const isDetectingRef = useRef<boolean>(false) // Guard against overlapping detection cycles
   const lastTimingLogRef = useRef<number>(0) // Throttle for frame-timing diagnostics
   const faceDetectorRef = useRef<FaceDetector | null>(null)
   const objectDetectorRef = useRef<ObjectDetector | null>(null)
+  const faceLandmarkerRef = useRef<FaceLandmarker | null>(null) // Head-pose + eye-gaze for eyes_off_screen
   const detectionIntervalRef = useRef<number | null>(null) // Store interval ID for detection
   
   const cellPhoneDetectionDebounceRef = useRef<number | null>(null) // For debounce
@@ -102,7 +119,8 @@ export default function App() {
   const activeMultipleFacesViolationRef = useRef<number | null>(null) // Index of active multiple_faces violation in violations array
   const activeTabSwitchViolationRef = useRef<number | null>(null) // Index of active tab_switch violation in violations array
   const activeWrongFaceViolationRef = useRef<number | null>(null) // Index of active wrong_face violation in violations array
-  
+  const activeEyesOffScreenViolationRef = useRef<number | null>(null) // Index of active eyes_off_screen violation in violations array
+
   // Session ID from URL parameters
   const sessionIdRef = useRef<string | null>(null)
   const [sessionIdDisplay, setSessionIdDisplay] = useState<string | null>(null)
@@ -400,6 +418,8 @@ export default function App() {
       return 'tab-switch'
     } else if (messageLower.includes('face mismatch') || messageLower.includes('wrong face')) {
       return 'face-mismatch'
+    } else if (messageLower.includes('eyes off screen') || messageLower.includes('eyes-off-screen')) {
+      return 'eyes-off-screen'
     }
     return null
   }, [])
@@ -416,6 +436,8 @@ export default function App() {
       return 'tab-switch'
     } else if (detectionType === 'wrong_face') {
       return 'face-mismatch'
+    } else if (detectionType === 'eyes_off_screen') {
+      return 'eyes-off-screen'
     }
     return null
   }, [])
@@ -671,6 +693,11 @@ export default function App() {
       activeMultipleFacesViolationRef.current = null // Reset active multiple_faces violation
       activeTabSwitchViolationRef.current = null // Reset active tab_switch violation
       activeWrongFaceViolationRef.current = null // Reset active wrong_face violation
+      activeEyesOffScreenViolationRef.current = null // Reset active eyes_off_screen violation
+      eyesOffScreenSinceRef.current = null // Reset the eyes_off_screen gating timer
+      eyesOnGraceStartRef.current = null
+      noSingleFaceSinceRef.current = null
+      gazeBaselineRef.current = null // Recalibrate resting posture at exam start
       examVideoChunksRef.current = []
       lastSavedSegmentTimeRef.current = Date.now()
 
@@ -893,6 +920,7 @@ export default function App() {
                                     violationType === 'face_not_visible' ? 'face_not_visible_detection' :
                                     violationType === 'tab_switch' ? 'tab_switch_detection' :
                                     violationType === 'wrong_face' ? 'wrong_face_detection' :
+                                    violationType === 'eyes_off_screen' ? 'eyes_off_screen_detection' :
                                     'violation'
     const pendingFilename = `${pendingViolationTypeStr}_${pendingTimestamp}.${pendingExt}`
     const pendingId = addPendingRecordedVideo(pendingFilename, pendingExt)
@@ -995,6 +1023,7 @@ export default function App() {
                                    currentViolationType === 'face_not_visible' ? 'face_not_visible_detection' :
                                    currentViolationType === 'tab_switch' ? 'tab_switch_detection' :
                                    currentViolationType === 'wrong_face' ? 'wrong_face_detection' :
+                                   currentViolationType === 'eyes_off_screen' ? 'eyes_off_screen_detection' :
                                    'violation'
           const baseFilename = `${violationTypeStr}_${timestamp}`
 
@@ -1023,7 +1052,8 @@ export default function App() {
             'face_not_visible': 'face-not-visible',
             'multiple_faces': 'multiple-faces',
             'tab_switch': 'tab-switch',
-            'wrong_face': 'face-mismatch'
+            'wrong_face': 'face-mismatch',
+            'eyes_off_screen': 'eyes-off-screen'
           }
           const eventType = eventTypeMap[currentViolationType] || currentViolationType || 'unknown'
 
@@ -1127,7 +1157,7 @@ export default function App() {
   // Add violation to list when detected
   const addViolation = useCallback((type: DetectionType, score?: number) => {
     // For face_not_visible, cell_phone, multiple_faces, and tab_switch, track as duration - update existing or create new
-    if (type === 'face_not_visible' || type === 'cell_phone' || type === 'multiple_faces' || type === 'tab_switch' || type === 'wrong_face') {
+    if (type === 'face_not_visible' || type === 'cell_phone' || type === 'multiple_faces' || type === 'tab_switch' || type === 'wrong_face' || type === 'eyes_off_screen') {
       setViolations(prev => {
         const activeRef = type === 'face_not_visible'
           ? activeFaceNotVisibleViolationRef
@@ -1137,7 +1167,9 @@ export default function App() {
           ? activeMultipleFacesViolationRef
           : type === 'tab_switch'
           ? activeTabSwitchViolationRef
-          : activeWrongFaceViolationRef
+          : type === 'wrong_face'
+          ? activeWrongFaceViolationRef
+          : activeEyesOffScreenViolationRef
         
         // Check if there's an active violation of this type
         if (activeRef.current !== null) {
@@ -1188,6 +1220,8 @@ export default function App() {
           ? 'Tab Switch Detected'
           : type === 'wrong_face'
           ? 'Face Mismatch Detected'
+          : type === 'eyes_off_screen'
+          ? 'Eyes Off Screen Detected'
           : 'Violation Detected'
         addLogEntry(violationMessage)
         
@@ -1249,7 +1283,24 @@ export default function App() {
       })
       
       objectDetectorRef.current = objectDetector
-      
+
+      // Load Face Landmarker for head-pose + eye-gaze (drives eyes_off_screen).
+      // Outputs the 4x4 facial transformation matrix (head yaw/pitch) and ARKit
+      // blendshapes (eyeLookIn/Out/Up/Down) so we can tell where the candidate is
+      // looking without hand-rolling iris geometry.
+      const faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+          delegate: 'GPU'
+        },
+        runningMode: 'VIDEO',
+        numFaces: 1,
+        outputFaceBlendshapes: true,
+        outputFacialTransformationMatrixes: true
+      })
+
+      faceLandmarkerRef.current = faceLandmarker
+
       setModelsLoaded(true)
 
       // Start detection interval - 100ms for real-time detection (10 FPS)
@@ -1473,7 +1524,83 @@ export default function App() {
           // alerting per requirement; raise to 500-800ms if too noisy.
           const FACE_NOT_VISIBLE_THRESHOLD_MS = 150
           const MULTIPLE_FACES_THRESHOLD_MS = 150
-          
+          // eyes_off_screen gating + thresholds. We only want to record GROSS
+          // look-aways (clearly turning the head/eyes away from the screen), not
+          // the small natural glances candidates make constantly. So the limits
+          // are deliberately high and the look-away must be SUSTAINED (~2s)
+          // before firing. Head yaw/pitch are in degrees; gaze magnitudes are
+          // ARKit blendshape scores (0..1). A head turned/tilted away (left, right,
+          // up OR down) with the iris FOLLOWING it counts as looking away.
+          // Sustained-hold durations before a look-away is recorded. Horizontal
+          // (left/right) and vertical (up/down) are tuned separately: glancing
+          // down at a keyboard/desk is more common and natural than a sustained
+          // side glance, so vertical is held longer to avoid false positives.
+          const EYES_OFF_SCREEN_HORIZONTAL_MS = 1500 // left/right sustained hold
+          // Vertical holds are DIRECTION-SPLIT like the limits: browser chrome
+          // (URL bar, downloads) lives at the top of the screen, so up gets a
+          // long hold; down is the prime cheat direction (desk notes, phone in
+          // lap), so it fires fast. NOTE: sustained keyboard-gazing while
+          // typing can resemble reading desk notes — if that false-fires in
+          // practice, raise EYES_OFF_SCREEN_DOWN_MS rather than the limits.
+          const EYES_OFF_SCREEN_UP_MS = 2000 // up sustained hold (lenient)
+          const EYES_OFF_SCREEN_DOWN_MS = 800 // down sustained hold (fast)
+          // Graduated hold: the 1500ms holds above exist to filter BORDERLINE
+          // glances (score hovering near 1.0). A GROSS look-away — score well
+          // past threshold, e.g. eyes dropped to a phone in the lap (~1.5-2.0)
+          // — is unambiguous, so waiting the full hold only delays the alert.
+          const GROSS_LOOK_AWAY_SCORE = 1.4 // score at/past this = clearly away
+          const EYES_OFF_SCREEN_GROSS_MS = 600 // fast hold for gross look-aways
+          const HEAD_YAW_LIMIT_DEG = 30 // clear left/right head turn
+          // Gaze that, on its own, equals ONE full unit of look-away. Combined
+          // with head pose below, so these are the point where the EYES alone
+          // (head straight) count as off-screen. Lower = more sensitive. Kept low
+          // enough that a moderate eye-drop to read desk notes contributes even
+          // before the iris reaches the extreme edge of the eye.
+          // gazeH sums two blendshapes per direction (range ~ -2..2); gazeV takes a
+          // single-eye max (range ~ -1..1) — hence the different limits.
+          const GAZE_HORIZONTAL_LOOK_AWAY = 0.6 // eye-only left/right swivel = 1 unit
+          // Vertical is split by DIRECTION. Cheating on desk notes is a
+          // downward glance, so DOWN stays sensitive. UP is given much more
+          // headroom: on a large/tall monitor, glancing at the URL bar or the
+          // top of the page is a small head-up + eye-up that is still
+          // on-screen, and the old symmetric limits summed those into a false
+          // violation.
+          const HEAD_PITCH_UP_LIMIT_DEG = 50 // head tilt UP that alone = look-away
+          const HEAD_PITCH_DOWN_LIMIT_DEG = 20 // head tilt DOWN that alone = look-away
+          const GAZE_UP_LOOK_AWAY = 1.0 // eye-only upward swivel = 1 unit (lenient)
+          // Eye-only down is deliberately NOT enough to fire from a normal
+          // screen glance: the bottom of the screen (submit buttons!) is an
+          // eye-drop of ~0.3-0.5, while reading the desk needs either an
+          // extreme eye-drop or real head-down. Head-down + eyes-down together
+          // (the actual notes/phone posture) still lands well past 1.0.
+          const GAZE_DOWN_LOOK_AWAY = 0.65
+          // Both lids at/past this blink score = eyes closed. Gaze blendshapes
+          // are lid-driven and spike toward "down" during blinks/closure, so
+          // gaze is unscorable then — and closed eyes can't read notes anyway.
+          // Kept strict (0.7) because a steep down-gaze also droops the lids
+          // (~0.3-0.5) and must NOT be mistaken for closure.
+          const EYES_CLOSED_BLINK_SCORE = 0.7
+          // Flicker tolerance. A turned head often makes the face detector or
+          // the per-frame scores flicker for a frame or two; without a grace
+          // window those flickers restart the sustained-hold clock and a real
+          // look-away never accumulates its 1.5s. The hold only resets after
+          // the candidate has read as on-screen (or face-lost) CONTINUOUSLY
+          // for this long.
+          const EYES_ON_RESET_GRACE_MS = 500
+          // The posture baseline is only dropped (forcing recalibration) after
+          // the single-face view has been gone this long — i.e. the candidate
+          // genuinely left or repositioned, not a 1-frame detector dropout.
+          const BASELINE_RESET_AFTER_NO_FACE_MS = 10000
+          // When seeding the baseline we clamp toward neutral so that a
+          // look-away pose at seed time can't become the "on-screen" reference
+          // (which would suppress — or worse, invert — detection). Legit
+          // camera-geometry offsets (laptop cam below screen, etc.) fall well
+          // inside these clamps, and the EMA refines the rest once settled.
+          const BASELINE_SEED_YAW_CLAMP_DEG = 15
+          const BASELINE_SEED_PITCH_CLAMP_DEG = 15
+          const BASELINE_SEED_GAZE_H_CLAMP = 0.3
+          const BASELINE_SEED_GAZE_V_CLAMP = 0.25
+
           let currentDetection: DetectionType = null
           
           // Detect smartphone using object detection
@@ -1629,6 +1756,287 @@ export default function App() {
               })
               activeFaceNotVisibleViolationRef.current = null
               // Episode close deferred to the EPISODE_GAP_MS sweep.
+            }
+          }
+
+          // --- eyes_off_screen: head-pose + eye-gaze (only when exactly ONE face) ---
+          // The FaceLandmarker runs only for the normal single-face case, so it
+          // adds no per-frame cost while a higher-priority face-count violation is
+          // active, and the !currentDetection guard keeps it below cell_phone.
+          if (faceCount === 1) noSingleFaceSinceRef.current = null
+          if (faceCount === 1 && !currentDetection && faceLandmarkerRef.current) {
+            let isEyesOff = false
+            let offMagnitude = 0
+            let requiredHoldMs = EYES_OFF_SCREEN_HORIZONTAL_MS
+            // HUD readouts drawn on the overlay as visual proof of the decision.
+            let hudYaw = 0
+            let hudPitch = 0
+            let hudGaze = 0
+            let hudGazeV = 0
+            try {
+              const lmResult = faceLandmarkerRef.current.detectForVideo(video, startTimeMs)
+
+              // Head pose from the 4x4 facial transformation matrix (column-major:
+              // R[row][col] === data[col*4 + row]). Standard Tait-Bryan extraction.
+              // Signed: +yaw = head turned to the subject's right, +pitch = up.
+              let headYaw = 0
+              let headPitch = 0
+              const matrix = lmResult.facialTransformationMatrixes?.[0]?.data
+              if (matrix) {
+                headYaw = Math.atan2(matrix[2], Math.sqrt(matrix[6] * matrix[6] + matrix[10] * matrix[10])) * (180 / Math.PI) // left/right turn
+                headPitch = Math.atan2(-matrix[6], matrix[10]) * (180 / Math.PI) // up(+)/down(-); flip sign here if inverted on your camera
+              }
+
+              // Eye gaze from ARKit blendshapes, kept SIGNED on both axes.
+              // +gazeH = iris to the subject's right, -gazeH = left, ~0 = centered.
+              // +gazeV = iris up, -gazeV = down, ~0 = centered.
+              let gazeH = 0
+              let gazeV = 0
+              let eyesClosed = false
+              const shapes = lmResult.faceBlendshapes?.[0]?.categories
+              if (shapes) {
+                const shape = (name: string) => shapes.find(c => c.categoryName === name)?.score ?? 0
+                // +gazeH = iris to the subject's RIGHT. For the RIGHT eye that is
+                // "out" (away from nose); for the LEFT eye that is "in" (toward
+                // nose). The mirror-image applies for looking left. (These were
+                // previously swapped, which inverted gazeH so it cancelled headYaw
+                // in the signed score and suppressed real horizontal look-aways.)
+                const gazeRight = shape('eyeLookOutRight') + shape('eyeLookInLeft')
+                const gazeLeft = shape('eyeLookOutLeft') + shape('eyeLookInRight')
+                gazeH = gazeRight - gazeLeft
+                const gazeUp = Math.max(shape('eyeLookUpLeft'), shape('eyeLookUpRight'))
+                const gazeDown = Math.max(shape('eyeLookDownLeft'), shape('eyeLookDownRight'))
+                gazeV = gazeUp - gazeDown
+                // min of both lids: a one-eyed wink must not disable scoring.
+                eyesClosed = Math.min(shape('eyeBlinkLeft'), shape('eyeBlinkRight')) >= EYES_CLOSED_BLINK_SCORE
+              }
+
+              // Combined head + eye look-away score, one per axis. Head pose and
+              // gaze are each normalized to their own limit, then merged so that a
+              // MODERATE head movement plus a MODERATE eye movement in the same
+              // direction add up to a look-away — even though neither crossed its
+              // threshold alone. This is the "looking down to read desk notes"
+              // case: the head dips a little and the eyes roll down a little, and
+              // together that is clearly off-screen. A score magnitude >= 1 = away.
+              //
+              // Horizontal uses a SIGNED sum so that eyes counter-rotating against a
+              // turned head (to keep the screen in view) cancel out and stay ON
+              // screen. Vertical uses MAGNITUDES (sign-agnostic) because the head
+              // pitch sign can be camera-dependent, and for reading notes the head
+              // and eyes both go down together anyway.
+              // Score look-away as DEVIATION from the resting baseline instead of
+              // absolute angles. Seed on the first frame; afterwards the baseline
+              // EMA-tracks only while the candidate looks settled/on-screen (see
+              // the update at the bottom of this block), so it captures the
+              // camera geometry + natural posture — e.g. a laptop camera below
+              // the screen makes "looking at the screen" a downward gaze, and the
+              // baseline absorbs that so it no longer reads as a look-away.
+              const baseline = gazeBaselineRef.current
+              const dYaw = headYaw - (baseline?.yaw ?? headYaw)
+              const dPitch = headPitch - (baseline?.pitch ?? headPitch)
+              let dGazeH = gazeH - (baseline?.gazeH ?? gazeH)
+              let dGazeV = gazeV - (baseline?.gazeV ?? gazeV)
+              // Closed lids make the gaze estimates garbage (they read as a
+              // hard down-gaze), and closed eyes can't read notes — so drop
+              // the gaze terms entirely. Head-pose scoring stays live: a full
+              // head turn/dip is a look-away regardless of lid state.
+              if (eyesClosed) {
+                dGazeH = 0
+                dGazeV = 0
+              }
+
+              const hScore = dYaw / HEAD_YAW_LIMIT_DEG + dGazeH / GAZE_HORIZONTAL_LOOK_AWAY
+
+              // Learn the camera's pitch-sign convention from head/eye
+              // agreement: during a vertical glance the head and the eyes move
+              // the SAME direction, and the eye-gaze sign (blendshapes) is
+              // anatomically fixed. If accumulated evidence says head pitch
+              // disagrees, the matrix pitch is inverted on this camera — flip
+              // it. Without this, an inverted camera scores upward glances
+              // with the strict DOWN limits and downward glances with the
+              // lenient UP limits (i.e. up over-fires, down under-fires).
+              if (Math.abs(dGazeV) > 0.15 && Math.abs(dPitch) > 3) {
+                const agree = Math.sign(dPitch) === Math.sign(dGazeV) ? 1 : -1
+                pitchSignEvidenceRef.current = Math.max(-50, Math.min(50, pitchSignEvidenceRef.current + agree))
+              }
+              const dPitchV = (pitchSignEvidenceRef.current < 0 ? -1 : 1) * dPitch
+
+              // Vertical: score UP and DOWN separately (with direction-specific
+              // limits) and take the worse one. Only same-direction head+eye
+              // components add — head-down + eyes-up (slouching while still
+              // reading the screen) no longer sums into a false look-away the
+              // way the old |dPitch|+|dGazeV| form did. +dPitchV/+dGazeV = up.
+              const vScoreUp =
+                Math.max(0, dPitchV) / HEAD_PITCH_UP_LIMIT_DEG + Math.max(0, dGazeV) / GAZE_UP_LOOK_AWAY
+              const vScoreDown =
+                Math.max(0, -dPitchV) / HEAD_PITCH_DOWN_LIMIT_DEG + Math.max(0, -dGazeV) / GAZE_DOWN_LOOK_AWAY
+              const vScore = Math.max(vScoreUp, vScoreDown)
+
+              // A CLEAR head turn (relative to baseline) on its own is off-screen,
+              // even if the gaze blendshapes disagree. At an extreme left/right
+              // profile one eye is occluded and MediaPipe's gaze estimate goes
+              // unreliable (often reporting the opposite direction), which would
+              // otherwise cancel the large yaw in the signed hScore and suppress
+              // the detection.
+              const grossHeadTurn = Math.abs(dYaw) >= HEAD_YAW_LIMIT_DEG
+              const horizontalLookAway = Math.abs(hScore) >= 1 || grossHeadTurn
+              const upLookAway = vScoreUp >= 1
+              const downLookAway = vScoreDown >= 1
+              const verticalLookAway = upLookAway || downLookAway
+
+              // Seed the baseline on the first landmarked frame, CLAMPED toward
+              // neutral. With no baseline all deviations read 0, so without the
+              // clamp whatever pose the candidate happened to hold at seed time
+              // (including mid-look-away, e.g. right after a face-detector
+              // dropout) became the "on-screen" reference — suppressing real
+              // look-aways and flagging the return to the screen instead.
+              if (!baseline) {
+                const clamp = (v: number, lim: number) => Math.max(-lim, Math.min(lim, v))
+                gazeBaselineRef.current = {
+                  yaw: clamp(headYaw, BASELINE_SEED_YAW_CLAMP_DEG),
+                  pitch: clamp(headPitch, BASELINE_SEED_PITCH_CLAMP_DEG),
+                  gazeH: clamp(gazeH, BASELINE_SEED_GAZE_H_CLAMP),
+                  gazeV: clamp(gazeV, BASELINE_SEED_GAZE_V_CLAMP)
+                }
+              } else if (Math.abs(hScore) < 0.5 && vScore < 0.5 && !eyesClosed) {
+                // Adapt the baseline toward the current posture ONLY when the
+                // candidate looks settled on-screen (both axes well under
+                // threshold) with eyes open — closed-lid frames carry garbage
+                // gaze values that would train the baseline toward "down".
+                // Slow EMA so a brief centered glance can't reset it, and
+                // excluding flagged frames means a sustained look-away never
+                // trains the baseline to accept itself.
+                const a = 0.03 // EMA weight
+                baseline.yaw += a * (headYaw - baseline.yaw)
+                baseline.pitch += a * (headPitch - baseline.pitch)
+                baseline.gazeH += a * (gazeH - baseline.gazeH)
+                baseline.gazeV += a * (gazeV - baseline.gazeV)
+              }
+
+              // HUD shows the DEVIATION values that actually drive the scores
+              // (pitch shown sign-corrected, since that's what gets scored).
+              hudYaw = dYaw
+              hudPitch = dPitchV
+              hudGaze = dGazeH
+              hudGazeV = dGazeV
+              if (horizontalLookAway || verticalLookAway) {
+                isEyesOff = true
+                // When several directions are off at once, fire on the
+                // earliest (shortest) applicable hold.
+                requiredHoldMs = Math.min(
+                  horizontalLookAway ? EYES_OFF_SCREEN_HORIZONTAL_MS : Infinity,
+                  upLookAway ? EYES_OFF_SCREEN_UP_MS : Infinity,
+                  downLookAway ? EYES_OFF_SCREEN_DOWN_MS : Infinity
+                )
+                offMagnitude = Math.max(
+                  Math.abs(hScore),
+                  grossHeadTurn ? Math.abs(dYaw) / HEAD_YAW_LIMIT_DEG : 0,
+                  vScore
+                )
+                // Unambiguous look-away -> shorten the hold so blatant cases
+                // (eyes on a phone in the lap, full head turn to notes) alert
+                // quickly; borderline scores still ride out the full hold.
+                if (offMagnitude >= GROSS_LOOK_AWAY_SCORE) {
+                  requiredHoldMs = Math.min(requiredHoldMs, EYES_OFF_SCREEN_GROSS_MS)
+                }
+              }
+
+              // --- Visual proof: draw the face mesh (skeleton) + eyes/irises and a
+              // live HUD, colored red while off-screen and green while on-screen. ---
+              const landmarks = lmResult.faceLandmarks?.[0]
+              if (landmarks) {
+                const drawingUtils = new DrawingUtils(ctx)
+                const meshColor = isEyesOff ? 'rgba(255,64,64,0.45)' : 'rgba(0,255,128,0.35)'
+                const eyeColor = isEyesOff ? '#ff2d2d' : '#00ff88'
+
+                // Full-face tessellation = the "skeleton" wireframe.
+                drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_TESSELATION, { color: meshColor, lineWidth: 1 })
+                // Highlight both eyes and irises so gaze is easy to read.
+                drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE, { color: eyeColor, lineWidth: 2 })
+                drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LEFT_EYE, { color: eyeColor, lineWidth: 2 })
+                drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_RIGHT_IRIS, { color: eyeColor, lineWidth: 2 })
+                drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LEFT_IRIS, { color: eyeColor, lineWidth: 2 })
+
+                // HUD readout box (top-right corner).
+                const boxW = 250
+                const boxX = videoWidth - boxW - 10
+                ctx.fillStyle = isEyesOff ? 'rgba(200,0,0,0.75)' : 'rgba(0,140,60,0.75)'
+                ctx.fillRect(boxX, 10, boxW, 122)
+                ctx.fillStyle = '#ffffff'
+                ctx.font = 'bold 16px Arial'
+                ctx.fillText(isEyesOff ? 'EYES OFF SCREEN' : eyesClosed ? 'EYES CLOSED' : 'EYES ON SCREEN', boxX + 10, 32)
+                ctx.font = '13px Arial'
+                ctx.fillText(`yaw ${hudYaw.toFixed(0)}°/${HEAD_YAW_LIMIT_DEG}°  pitch ${hudPitch.toFixed(0)}° (up/${HEAD_PITCH_UP_LIMIT_DEG}° dn/${HEAD_PITCH_DOWN_LIMIT_DEG}°)`, boxX + 10, 54)
+                ctx.fillText(`irisH ${hudGaze.toFixed(2)}  irisV ${hudGazeV.toFixed(2)}`, boxX + 10, 72)
+                ctx.fillText(`H-score ${Math.abs(hScore).toFixed(2)}/1.0 (head+eyes)`, boxX + 10, 90)
+                ctx.fillText(`V-score ${vScore.toFixed(2)}/1.0 (up ${vScoreUp.toFixed(2)} / dn ${vScoreDown.toFixed(2)})`, boxX + 10, 108)
+                ctx.fillText(`held ${eyesOffScreenSinceRef.current ? (Date.now() - eyesOffScreenSinceRef.current) : 0}ms / ${requiredHoldMs}ms`, boxX + 10, 126)
+              }
+            } catch (lmError) {
+              console.error('Error during FaceLandmarker detection:', lmError)
+            }
+
+            if (isEyesOff) {
+              eyesOnGraceStartRef.current = null
+              lastSeenRef.current.set('eyes_off_screen', Date.now())
+              if (eyesOffScreenSinceRef.current === null) eyesOffScreenSinceRef.current = Date.now()
+
+              if (Date.now() - eyesOffScreenSinceRef.current >= requiredHoldMs) {
+                currentDetection = 'eyes_off_screen'
+                latestDetectionScoreRef.current = { type: 'eyes_off_screen', score: offMagnitude }
+
+                // Fire directly, mirroring multiple_faces / face_not_visible.
+                const streamToUse = getMediaStream()
+                const examIsActive = isExamActiveRef.current || isExamActive
+                if (examIsActive && streamToUse) {
+                  startViolationRecording(streamToUse, new Date(), 'eyes_off_screen').catch((error) => {
+                    console.error('Error starting violation recording:', error)
+                  })
+                }
+                addViolation('eyes_off_screen', offMagnitude)
+              }
+            } else {
+              // Don't restart the sustained-hold clock on a single noisy
+              // on-screen frame — require the on-screen reading to persist for
+              // the grace window first.
+              if (eyesOnGraceStartRef.current === null) eyesOnGraceStartRef.current = Date.now()
+              if (Date.now() - eyesOnGraceStartRef.current >= EYES_ON_RESET_GRACE_MS) {
+                eyesOffScreenSinceRef.current = null
+              }
+              if (activeEyesOffScreenViolationRef.current !== null) {
+                setViolations(prev => {
+                  const activeIndex = activeEyesOffScreenViolationRef.current
+                  if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'eyes_off_screen') {
+                    const updated = [...prev]
+                    const currentTime = new Date()
+                    updated[activeIndex] = {
+                      ...updated[activeIndex],
+                      endTime: new Date(currentTime.getTime() + 10000) // +10 seconds after detection ends
+                    }
+                    return updated
+                  }
+                  return prev
+                })
+                activeEyesOffScreenViolationRef.current = null
+                // Episode close deferred to the EPISODE_GAP_MS sweep.
+              }
+            }
+          } else if (faceCount !== 1) {
+            // A turned head frequently makes the face detector drop the face
+            // for a frame or two, so treat face-count flicker with the same
+            // grace as an on-screen flicker: the look-away hold only resets
+            // after the grace window, and the posture baseline is only dropped
+            // (for recalibration) once the single-face view has been gone long
+            // enough to mean the candidate actually left or repositioned —
+            // otherwise it would re-seed from whatever pose they hold when the
+            // face returns, poisoning the reference.
+            if (noSingleFaceSinceRef.current === null) noSingleFaceSinceRef.current = Date.now()
+            if (eyesOnGraceStartRef.current === null) eyesOnGraceStartRef.current = Date.now()
+            if (Date.now() - eyesOnGraceStartRef.current >= EYES_ON_RESET_GRACE_MS) {
+              eyesOffScreenSinceRef.current = null
+            }
+            if (Date.now() - noSingleFaceSinceRef.current >= BASELINE_RESET_AFTER_NO_FACE_MS) {
+              gazeBaselineRef.current = null
             }
           }
 
@@ -1894,6 +2302,10 @@ export default function App() {
       if (objectDetectorRef.current) {
         objectDetectorRef.current.close()
         objectDetectorRef.current = null
+      }
+      if (faceLandmarkerRef.current) {
+        faceLandmarkerRef.current.close()
+        faceLandmarkerRef.current = null
       }
       
       // Stop exam recording if active (using react-media-recorder)
