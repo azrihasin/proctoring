@@ -1215,7 +1215,7 @@ export default function App() {
         const violationMessage = type === 'face_not_visible' 
           ? 'Face Not Visible' 
           : type === 'cell_phone'
-          ? `Cell Phone Detected (${((score || 0) * 100).toFixed(1)}%)`
+          ? `Possible Phone Usage (${((score || 0) * 100).toFixed(1)}%)`
           : type === 'multiple_faces'
           ? 'Multiple Faces Detected'
           : type === 'tab_switch'
@@ -1223,7 +1223,7 @@ export default function App() {
           : type === 'wrong_face'
           ? 'Face Mismatch Detected'
           : type === 'eyes_off_screen'
-          ? 'Eyes Off Screen Detected'
+          ? 'Possible Looking Away Violation'
           : 'Violation Detected'
         addLogEntry(violationMessage)
         
