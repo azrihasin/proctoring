@@ -31,7 +31,7 @@ export function VideoPreview({
       preload="metadata"
       playsInline
       className={cn(
-        "w-full aspect-video rounded-md bg-black object-cover",
+        "w-full aspect-video rounded-md border-0 bg-black object-cover",
         className
       )}
     />
