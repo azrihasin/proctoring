@@ -7,8 +7,8 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
 import { VideoPreview } from '@/components/VideoPreview'
-import { fixWebmMetadata } from '@/lib/utils'
-import { Eye, EyeOff, Layers, Square, Download } from 'lucide-react'
+import { fixWebmMetadata, cn } from '@/lib/utils'
+import { Eye, EyeOff, Layers, Check, Download } from 'lucide-react'
 import axios from 'axios'
 import { useFaceProctoring } from '@/proctoring/useFaceProctoring'
 // import EKYC from '@/components/EKYC'
@@ -226,7 +226,36 @@ export default function App() {
   const violationPendingIdsRef = useRef<Map<DetectionType, string>>(new Map())
   
   // UI state
-  const [isOverlayEnabled, setIsOverlayEnabled] = useState(true)
+  // Per-detection overlay toggles. Each controls whether that detector's boxes /
+  // HUD are DRAWN on the webcam canvas (detection/violation logic is unaffected).
+  // The detection loop runs from a stale interval closure, so it reads these from
+  // refs — the state copies below only drive the checkbox menu UI.
+  const [showPersonOverlay, setShowPersonOverlay] = useState(true)
+  const [showPhoneOverlay, setShowPhoneOverlay] = useState(true)
+  const [showEyesOverlay, setShowEyesOverlay] = useState(true)
+  const showPersonOverlayRef = useRef(true)
+  const showPhoneOverlayRef = useRef(true)
+  const showEyesOverlayRef = useRef(true)
+  const [isOverlayMenuOpen, setIsOverlayMenuOpen] = useState(false)
+  const overlayMenuRef = useRef<HTMLDivElement>(null)
+
+  // Mirror the overlay toggle state into refs so the (stale-closure) detection
+  // loop always draws according to the latest choice.
+  useEffect(() => { showPersonOverlayRef.current = showPersonOverlay }, [showPersonOverlay])
+  useEffect(() => { showPhoneOverlayRef.current = showPhoneOverlay }, [showPhoneOverlay])
+  useEffect(() => { showEyesOverlayRef.current = showEyesOverlay }, [showEyesOverlay])
+
+  // Close the overlay checkbox menu when clicking anywhere outside it.
+  useEffect(() => {
+    if (!isOverlayMenuOpen) return
+    const handleClickOutside = (event: MouseEvent) => {
+      if (overlayMenuRef.current && !overlayMenuRef.current.contains(event.target as Node)) {
+        setIsOverlayMenuOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [isOverlayMenuOpen])
   const [logEntries, setLogEntries] = useState<string[]>([])
   const [isViewVisible, setIsViewVisible] = useState(false) // Toggle visibility for camera, log, and recorded list
   
@@ -1383,8 +1412,9 @@ export default function App() {
             ctx.clearRect(0, 0, videoWidth, videoHeight)
 
             const faceCount = faceResults.detections.length
-            
-            // Draw face detections
+
+            // Draw face detections (person detection overlay)
+            if (showPersonOverlayRef.current)
             faceResults.detections.forEach((detection, index) => {
               const bbox = detection.boundingBox
               if (bbox) {
@@ -1419,8 +1449,8 @@ export default function App() {
               }
             })
 
-            // Draw object detections - ONLY cell phones
-            if (objectResults.detections && objectResults.detections.length > 0) {
+            // Draw object detections - ONLY cell phones (phone usage overlay)
+            if (showPhoneOverlayRef.current && objectResults.detections && objectResults.detections.length > 0) {
               objectResults.detections.forEach((detection) => {
                 if (!detection.categories || detection.categories.length === 0) return
                 
@@ -1470,8 +1500,8 @@ export default function App() {
               })
             }
 
-            // Display detection status at top of canvas
-            if (faceCount > 1) {
+            // Display detection status at top of canvas (person detection overlay)
+            if (showPersonOverlayRef.current && faceCount > 1) {
               ctx.fillStyle = '#ff0000'
               ctx.fillRect(10, 10, 220, 40)
               ctx.fillStyle = '#ffffff'
@@ -1481,7 +1511,7 @@ export default function App() {
                 15,
                 35
               )
-            } else if (faceCount === 1) {
+            } else if (showPersonOverlayRef.current && faceCount === 1) {
               ctx.fillStyle = '#00ff00'
               ctx.fillRect(10, 10, 200, 40)
               ctx.fillStyle = '#ffffff'
@@ -1506,7 +1536,7 @@ export default function App() {
                 return isPhone && category.score >= 0.42
               }).length : 0
             
-            if (cellPhoneCount > 0) {
+            if (showPhoneOverlayRef.current && cellPhoneCount > 0) {
               ctx.fillStyle = 'rgba(255, 0, 255, 0.7)'
               ctx.fillRect(10, videoHeight - 50, 250, 40)
               ctx.fillStyle = '#ffffff'
@@ -1946,7 +1976,7 @@ export default function App() {
               // --- Visual proof: draw the face mesh (skeleton) + eyes/irises and a
               // live HUD, colored red while off-screen and green while on-screen. ---
               const landmarks = lmResult.faceLandmarks?.[0]
-              if (landmarks) {
+              if (landmarks && showEyesOverlayRef.current) {
                 const drawingUtils = new DrawingUtils(ctx)
                 const meshColor = isEyesOff ? 'rgba(255,64,64,0.45)' : 'rgba(0,255,128,0.35)'
                 const eyeColor = isEyesOff ? '#ff2d2d' : '#00ff88'
@@ -2386,7 +2416,7 @@ export default function App() {
     // widen/heighten the element by 1/scale (here 200% for scale 0.5) so the
     // scaled content still fills the viewport. Tune SCALE to taste.
     <div
-      className="min-h-screen bg-muted/40 p-4"
+      className="min-h-screen bg-transparent p-4"
       style={{
         transform: 'scale(0.5)',
         transformOrigin: 'top left',
@@ -2466,61 +2496,93 @@ export default function App() {
                     )}
                   </>
                 )}
-                {isOverlayEnabled && (
-                  <canvas
-                    ref={canvasRef}
-                    className="absolute top-0 left-0 w-full h-full pointer-events-none"
-                    style={{ zIndex: 10 }}
-                  />
-                )}
+                <canvas
+                  ref={canvasRef}
+                  className="absolute top-0 left-0 w-full h-full pointer-events-none"
+                  style={{ zIndex: 10 }}
+                />
               </div>
             </CardContent>
           </Card>
 
           {/* Log Section - Takes 1 column */}
-          <Card className="flex flex-col">
-            <CardHeader className="flex-row items-center justify-between gap-2 space-y-0 border-b py-3 bg-muted rounded-t-lg">
+          <div className="rounded-lg bg-[#f5f5f5] flex flex-col">
+            <CardHeader className="flex-row items-center justify-between gap-2 space-y-0 py-3">
               <div className="flex items-center gap-2 flex-wrap">
                 <CardTitle className="text-lg">Log Section</CardTitle>
                 <Badge variant="secondary" className="font-normal">
                   <span className="font-semibold mr-1">Session ID:</span>
                   {sessionIdDisplay || 'No Session ID'}
                 </Badge>
-                <Badge
-                  variant={
-                    faceProctoringStatus.includes('DISABLED') || faceProctoringStatus.includes('FAILED')
-                      ? 'destructive'
-                      : 'secondary'
-                  }
-                  className="font-normal"
-                  title="Live status of the wrong-face (KYC mismatch) checker"
-                >
-                  {faceProctoringStatus}
-                </Badge>
-              </div>
-              <Button
-                onClick={() => setIsOverlayEnabled(!isOverlayEnabled)}
-                variant={isOverlayEnabled ? 'default' : 'secondary'}
-                size="icon"
-                title={isOverlayEnabled ? 'Disable Overlay' : 'Enable Overlay'}
-              >
-                {isOverlayEnabled ? (
-                  <Layers className="w-5 h-5" />
-                ) : (
-                  <Square className="w-5 h-5" />
+                {/* Wrong-face checker status badge hidden for now */}
+                {false && (
+                  <Badge
+                    variant={
+                      faceProctoringStatus.includes('DISABLED') || faceProctoringStatus.includes('FAILED')
+                        ? 'destructive'
+                        : 'secondary'
+                    }
+                    className="font-normal"
+                    title="Live status of the wrong-face (KYC mismatch) checker"
+                  >
+                    {faceProctoringStatus}
+                  </Badge>
                 )}
-              </Button>
+              </div>
+              <div className="relative" ref={overlayMenuRef}>
+                <Button
+                  onClick={() => setIsOverlayMenuOpen((open) => !open)}
+                  variant={showPersonOverlay || showPhoneOverlay || showEyesOverlay ? 'default' : 'secondary'}
+                  size="icon"
+                  title="Toggle detection overlays"
+                  aria-haspopup="true"
+                  aria-expanded={isOverlayMenuOpen}
+                >
+                  <Layers className="w-5 h-5" />
+                </Button>
+                {isOverlayMenuOpen && (
+                  <div className="absolute right-0 top-full z-50 mt-2 w-60 rounded-md border border-input bg-background p-1 shadow-md">
+                    <div className="px-2 py-1.5 text-xs font-semibold text-muted-foreground">
+                      Show on webcam
+                    </div>
+                    {([
+                      { label: 'Person detection', checked: showPersonOverlay, toggle: () => setShowPersonOverlay((v) => !v) },
+                      { label: 'Phone usage detection', checked: showPhoneOverlay, toggle: () => setShowPhoneOverlay((v) => !v) },
+                      { label: 'Eye looking away detection', checked: showEyesOverlay, toggle: () => setShowEyesOverlay((v) => !v) },
+                    ] as const).map((item) => (
+                      <button
+                        key={item.label}
+                        type="button"
+                        onClick={item.toggle}
+                        className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
+                      >
+                        <span
+                          className={cn(
+                            'flex h-4 w-4 shrink-0 items-center justify-center rounded border',
+                            item.checked
+                              ? 'border-primary bg-primary text-primary-foreground'
+                              : 'border-input bg-background'
+                          )}
+                        >
+                          {item.checked && <Check className="h-3 w-3" />}
+                        </span>
+                        <span>{item.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             </CardHeader>
             <CardContent className="p-4 flex-1 flex flex-col">
               <Textarea
                 ref={logSectionRef}
                 readOnly
                 value={logEntries.join('\n')}
-                className="h-full font-mono text-xs overflow-y-auto"
+                className="h-full max-h-[300px] [field-sizing:fixed] font-mono text-xs overflow-y-auto resize-none"
                 placeholder="Log entries will appear here..."
               />
             </CardContent>
-          </Card>
+          </div>
         </div>
 
         {/* Status Messages */}
@@ -2532,7 +2594,7 @@ export default function App() {
 
         {/* Recording Timer - Inside show/hide section */}
         {isViewVisible && isExamActive && examStartTime && (
-          <Card>
+          <div className="rounded-lg bg-[#f5f5f5]">
             <CardContent className="p-4 text-center">
               <div className="flex items-center justify-center gap-3">
                 <div className="flex items-center gap-2">
@@ -2549,13 +2611,13 @@ export default function App() {
                 Started at {examStartTime.toLocaleTimeString()}
               </p>
             </CardContent>
-          </Card>
+          </div>
         )}
 
         {/* Recorded Videos List */}
         {isViewVisible && (
-          <Card>
-            <CardHeader className="border-b py-3 bg-muted rounded-t-lg">
+          <div className="rounded-lg bg-[#f5f5f5]">
+            <CardHeader className="py-3">
               <CardTitle className="text-lg">Recorded Videos</CardTitle>
               <CardDescription>
                 {recordedVideos.length > 0
@@ -2669,7 +2731,7 @@ export default function App() {
                           e.stopPropagation()
                           downloadVideo(video)
                         }}
-                        className="w-full mt-auto"
+                        className="w-full mt-auto shadow-none"
                       >
                         <Download className="w-4 h-4" />
                         {video.status === 'pending' ? 'Recording…' : 'Download'}
@@ -2680,7 +2742,7 @@ export default function App() {
                 </div>
               )}
             </CardContent>
-          </Card>
+          </div>
         )}
       </div>
     </div>
