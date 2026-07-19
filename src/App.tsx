@@ -8,6 +8,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
 import { VideoPreview } from '@/components/VideoPreview'
 import { fixWebmMetadata, cn } from '@/lib/utils'
+import { closeExamModal } from '@/lib/parentMessenger'
 import { Layers, Check, Download, X } from 'lucide-react'
 import axios from 'axios'
 import { useFaceProctoring } from '@/proctoring/useFaceProctoring'
@@ -42,6 +43,11 @@ type SavedVideo = {
 // it is visible, so without this we would hit /event and /upload continuously.
 // One event + one 10s clip per type per window is plenty for review.
 const VIOLATION_COOLDOWN_MS = 30000 // 30 seconds
+
+// Combined face_not_visible + tab_switch occurrence count that auto-closes the
+// exam modal in the host app (via closeExamModal) — counts new violation
+// episodes only, not duration-extension updates of an already-active one.
+const CRITICAL_VIOLATION_AUTO_CLOSE_THRESHOLD = 7
 
 // Episode grace period. A violation re-fires every detection frame while it is
 // visible but can also briefly drop out (a face turning, a phone moving out of
@@ -121,6 +127,8 @@ export default function App() {
   const activeMultipleFacesViolationRef = useRef<number | null>(null) // Index of active multiple_faces violation in violations array
   const activeTabSwitchViolationRef = useRef<number | null>(null) // Index of active tab_switch violation in violations array
   const activeWrongFaceViolationRef = useRef<number | null>(null) // Index of active wrong_face violation in violations array
+  const criticalViolationOccurrenceCountRef = useRef(0) // Combined count of face_not_visible + tab_switch occurrences (new-violation events only, not duration updates)
+  const hasAutoClosedExamModalRef = useRef(false) // Guard so the auto-close threshold only fires once per session
   const activeEyesOffScreenViolationRef = useRef<number | null>(null) // Index of active eyes_off_screen violation in violations array
 
   // Bottom-left warning toaster (replaces the old on-canvas detection labels).
@@ -915,10 +923,14 @@ export default function App() {
         examVideoChunksRef.current = []
         examChunkRecorderRef.current = null
         rollingBufferRef.current = []
+
+        // Let the host exam application close the modal that embeds this app
+        closeExamModal()
     } catch (error) {
       console.error('Error ending exam:', error)
       setIsExamActive(false)
       setRecordingDuration(0)
+      closeExamModal()
     }
   }, [isExamActive, recordingDuration, saveVideo, addLogEntry, addRecordedVideo, getBestMimeType, stopExamRecording, stopViolationRecordingHook, violationRecordingStatus])
 
@@ -1264,7 +1276,17 @@ export default function App() {
         const newViolations = [...prev, violation]
         // Set the active index to the new violation
         activeRef.current = newViolations.length - 1
-        
+
+        // Auto-close: face_not_visible + tab_switch occurrences (new violations
+        // only, not duration-extension updates) combined reach the threshold
+        if ((type === 'face_not_visible' || type === 'tab_switch') && !hasAutoClosedExamModalRef.current) {
+          criticalViolationOccurrenceCountRef.current += 1
+          if (criticalViolationOccurrenceCountRef.current >= CRITICAL_VIOLATION_AUTO_CLOSE_THRESHOLD) {
+            hasAutoClosedExamModalRef.current = true
+            closeExamModal()
+          }
+        }
+
         // Add log entry
         const violationMessage = type === 'face_not_visible'
           ? 'Face Not Visible'
