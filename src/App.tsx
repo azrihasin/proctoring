@@ -139,7 +139,7 @@ export default function App() {
   const [warningToasts, setWarningToasts] = useState<Array<{ id: string; type: DetectionType; label: string; count: number }>>([])
   const violationOccurrenceCountRef = useRef<Map<DetectionType, number>>(new Map())
   const MAX_VISIBLE_TOASTS = 1
-  const TOAST_DURATION_MS = 4000
+  const TOAST_DURATION_MS = 2000
 
   const pushWarningToast = useCallback((type: DetectionType, label: string) => {
     const nextCount = (violationOccurrenceCountRef.current.get(type) || 0) + 1
