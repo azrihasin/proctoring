@@ -8,7 +8,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
 import { VideoPreview } from '@/components/VideoPreview'
 import { fixWebmMetadata, cn } from '@/lib/utils'
-import { Eye, EyeOff, Layers, Check, Download } from 'lucide-react'
+import { Layers, Check, Download, X } from 'lucide-react'
 import axios from 'axios'
 import { useFaceProctoring } from '@/proctoring/useFaceProctoring'
 // import EKYC from '@/components/EKYC'
@@ -174,7 +174,8 @@ export default function App() {
   // Exam recording state
   const [isExamActive, setIsExamActive] = useState(false)
   const isExamActiveRef = useRef(false) // Ref to avoid stale closures
-  const [examStartTime, setExamStartTime] = useState<Date | null>(null)
+  // Getter unused while the Recording Timer section below is commented out.
+  const [, setExamStartTime] = useState<Date | null>(null)
   const [recordingDuration, setRecordingDuration] = useState<number>(0) // Duration in seconds
   const examVideoChunksRef = useRef<Blob[]>([])
   const examTimerIntervalRef = useRef<number | null>(null) // For timer updates
@@ -280,7 +281,7 @@ export default function App() {
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [isOverlayMenuOpen])
   const [logEntries, setLogEntries] = useState<string[]>([])
-  const [isViewVisible, setIsViewVisible] = useState(false) // Toggle visibility for camera, log, and recorded list
+  const [isViewVisible] = useState(true) // Toggle visibility for camera, log, and recorded list (toggle button hidden from UI)
   
   // Recorded videos list
   const [recordedVideos, setRecordedVideos] = useState<RecordedVideo[]>([])
@@ -2423,62 +2424,33 @@ export default function App() {
   // }
 
   return (
-    // Downscale the entire app uniformly (layout + fonts) since it is embedded
-    // in a small ~1/3 x 1/3 viewport the candidate never directly sees.
-    // `zoom` is non-standard and silently ignored in some browsers/webviews
-    // (so it "only worked on localhost"). `transform: scale()` is the
-    // cross-browser equivalent, but it does not shrink the layout box, so we
-    // widen/heighten the element by 1/scale (here 200% for scale 0.5) so the
-    // scaled content still fills the viewport. Tune SCALE to taste.
-    <div
-      className="min-h-screen bg-transparent p-4"
-      style={{
-        transform: 'scale(0.5)',
-        transformOrigin: 'top left',
-        width: '200%',
-        height: '200%',
-      }}
-    >
-      <div className="max-w-7xl mx-auto space-y-4">
-        {/* Header */}
-        <div className="text-center">
-          <h1 className="text-3xl font-bold text-foreground">
-            {' '}
-          </h1>
-        </div>
+    // No transform/scale wrapper here on purpose. `transform` only affects
+    // painting, not layout — the parent (#app) sizes itself to the
+    // PRE-transform layout box, not the visually-scaled result. The old
+    // scale(0.5) + width:200% counter-scale hack (used back when this page
+    // had a full dashboard of UI to uniformly shrink) made the parent
+    // reserve ~2x the visual height, leaving empty space below the webcam.
+    // Now that the page is just the webcam, it sizes correctly at 1x via
+    // w-full + aspect-video, so no scaling trick is needed.
+    <div className="bg-transparent">
+      {/* handleStartExam/handleEndExam are invoked automatically once the
+          webcam + models are ready (see hasAutoStartedRef effect below) — no
+          visible controls are needed, so the header and start/stop buttons
+          that used to sit above the webcam were removed entirely rather than
+          hidden, since hidden elements were still occupying layout space and
+          causing the embedding page to scroll. */}
 
-        {/* Control Buttons - Outside Cards */}
-        <div className="flex items-center justify-center gap-3">
-          <Button
-            onClick={isExamActive ? handleEndExam : handleStartExam}
-            disabled={!webcamReady || !modelsLoaded}
-            variant={isExamActive ? 'destructive' : 'default'}
-            size="lg"
-            style={{ display: 'none' }}
-            className="font-semibold"
-          >
-            {isExamActive ? 'TAMAT PEPERIKSAAN' : 'MULA PEPERIKSAAN'}
-          </Button>
-          <Button
-            onClick={() => setIsViewVisible(!isViewVisible)}
-            variant="ghost"
-            size="icon"
-            title={isViewVisible ? 'Hide view' : 'Show view'}
-          >
-            {isViewVisible ? (
-              <Eye className="w-5 h-5" />
-            ) : (
-              <EyeOff className="w-5 h-5" />
-            )}
-          </Button>
-        </div>
-
-        {/* Video Feed and Log Section - Side by Side */}
-        <div className={`grid grid-cols-1 lg:grid-cols-3 gap-4 ${!isViewVisible ? 'hidden' : ''}`}>
-          {/* Video Feed - Takes 2 columns */}
-          <Card className="lg:col-span-2 overflow-hidden">
-            <CardContent className="p-0">
-              <div className="relative w-full aspect-video bg-black overflow-hidden">
+      {/* Webcam display — deliberately rendered OUTSIDE the max-w-7xl mx-auto
+          wrapper above so it is never bounded by that container. It spans
+          the full width of the embedding parent (w-full here resolves
+          against the outer scale(0.5) / 200% div, which itself is sized to
+          match the parent), with height derived from a 16:9 aspect ratio
+          instead of a fixed/viewport height so the feed never crops or
+          stretches. */}
+      <div className={!isViewVisible ? 'hidden' : ''}>
+        <Card className="overflow-hidden rounded-none border-x-0">
+          <CardContent className="p-0">
+            <div className="relative w-full aspect-video bg-black overflow-hidden">
                 {webcamError ? (
                   <div className="w-full h-full flex flex-col items-center justify-center text-white p-4">
                     <p className="text-lg font-semibold mb-2">Camera Access Error</p>
@@ -2524,19 +2496,34 @@ export default function App() {
                   {warningToasts.map(t => (
                     <div
                       key={t.id}
-                      className="flex items-center gap-2 rounded-md bg-white px-4 py-2.5 text-sm shadow-lg animate-in fade-in slide-in-from-left-2"
+                      className="flex items-center gap-2 rounded-md bg-white px-4 py-2.5 text-sm shadow-lg animate-in fade-in slide-in-from-left-2 pointer-events-auto"
                     >
-                      <span className="font-semibold text-slate-900">Warning/Amaran</span>
+                      <span className="font-semibold text-red-600">Warning/Amaran</span>
                       <span className="text-slate-400">:</span>
                       <span className="text-slate-700">{t.label}</span>
+                      <button
+                        type="button"
+                        onClick={() => setWarningToasts(prev => prev.filter(w => w.id !== t.id))}
+                        className="ml-2 shrink-0 rounded-sm p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors"
+                        aria-label="Dismiss warning"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
                     </div>
                   ))}
                 </div>
-              </div>
-            </CardContent>
-          </Card>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
 
-          {/* Log Section - Takes 1 column */}
+      <div className="max-w-7xl mx-auto space-y-4">
+        {/* Log Section — full width, stacked below the webcam. Live-scrolling
+            textarea of throttled violation/session events (see addLogEntry);
+            the overlay-toggle menu here only controls which detection
+            overlays draw on the webcam canvas, it does not affect what gets
+            logged. Commented out for now. */}
+        {false && isViewVisible && (
           <div className="rounded-lg bg-[#f5f5f5] flex flex-col">
             <CardHeader className="flex-row items-center justify-between gap-2 space-y-0 py-3">
               <div className="flex items-center gap-2 flex-wrap">
@@ -2614,16 +2601,9 @@ export default function App() {
               />
             </CardContent>
           </div>
-        </div>
-
-        {/* Status Messages */}
-        {!modelsLoaded && (
-          <div className="text-center">
-            <p className="text-primary font-semibold">Loading detection models...</p>
-          </div>
         )}
 
-        {/* Recording Timer - Inside show/hide section */}
+        {/* Recording Timer - Inside show/hide section — commented out for now
         {isViewVisible && isExamActive && examStartTime && (
           <div className="rounded-lg bg-[#f5f5f5]">
             <CardContent className="p-4 text-center">
@@ -2643,10 +2623,14 @@ export default function App() {
               </p>
             </CardContent>
           </div>
-        )}
+        )} */}
 
-        {/* Recorded Videos List */}
-        {isViewVisible && (
+        {/* Recorded Videos List — grid of exam/violation clips (see
+            RecordedVideo/addRecordedVideo/addPendingRecordedVideo). Each card
+            shows a live progress ring while 'pending', an inline
+            <VideoPreview> once 'ready', or a failed-state placeholder; only
+            'ready' clips are downloadable. */}
+        {false && isViewVisible && (
           <div className="rounded-lg bg-[#f5f5f5]">
             <CardHeader className="py-3">
               <CardTitle className="text-lg">Recorded Videos</CardTitle>
