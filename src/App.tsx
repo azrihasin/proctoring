@@ -123,6 +123,29 @@ export default function App() {
   const activeWrongFaceViolationRef = useRef<number | null>(null) // Index of active wrong_face violation in violations array
   const activeEyesOffScreenViolationRef = useRef<number | null>(null) // Index of active eyes_off_screen violation in violations array
 
+  // Bottom-left warning toaster (replaces the old on-canvas detection labels).
+  // One toast is pushed per NEW violation episode (never per frame — addViolation
+  // only reaches the "create new violation" branch once per episode thanks to the
+  // active*ViolationRef gating above), so this stays in sync with the same
+  // episode boundaries the recording/log pipeline already uses.
+  const [warningToasts, setWarningToasts] = useState<Array<{ id: string; type: DetectionType; label: string; count: number }>>([])
+  const violationOccurrenceCountRef = useRef<Map<DetectionType, number>>(new Map())
+  const MAX_VISIBLE_TOASTS = 1
+  const TOAST_DURATION_MS = 4000
+
+  const pushWarningToast = useCallback((type: DetectionType, label: string) => {
+    const nextCount = (violationOccurrenceCountRef.current.get(type) || 0) + 1
+    violationOccurrenceCountRef.current.set(type, nextCount)
+    const id = `${type}-${Date.now()}`
+    setWarningToasts(prev => {
+      const next = [...prev, { id, type, label, count: nextCount }]
+      return next.slice(Math.max(0, next.length - MAX_VISIBLE_TOASTS))
+    })
+    window.setTimeout(() => {
+      setWarningToasts(prev => prev.filter(t => t.id !== id))
+    }, TOAST_DURATION_MS)
+  }, [])
+
   // Session ID from URL parameters
   const sessionIdRef = useRef<string | null>(null)
   const [sessionIdDisplay, setSessionIdDisplay] = useState<string | null>(null)
@@ -230,12 +253,12 @@ export default function App() {
   // HUD are DRAWN on the webcam canvas (detection/violation logic is unaffected).
   // The detection loop runs from a stale interval closure, so it reads these from
   // refs — the state copies below only drive the checkbox menu UI.
-  const [showPersonOverlay, setShowPersonOverlay] = useState(true)
-  const [showPhoneOverlay, setShowPhoneOverlay] = useState(true)
-  const [showEyesOverlay, setShowEyesOverlay] = useState(true)
-  const showPersonOverlayRef = useRef(true)
-  const showPhoneOverlayRef = useRef(true)
-  const showEyesOverlayRef = useRef(true)
+  const [showPersonOverlay, setShowPersonOverlay] = useState(false)
+  const [showPhoneOverlay, setShowPhoneOverlay] = useState(false)
+  const [showEyesOverlay, setShowEyesOverlay] = useState(false)
+  const showPersonOverlayRef = useRef(false)
+  const showPhoneOverlayRef = useRef(false)
+  const showEyesOverlayRef = useRef(false)
   const [isOverlayMenuOpen, setIsOverlayMenuOpen] = useState(false)
   const overlayMenuRef = useRef<HTMLDivElement>(null)
 
@@ -1241,8 +1264,8 @@ export default function App() {
         activeRef.current = newViolations.length - 1
         
         // Add log entry
-        const violationMessage = type === 'face_not_visible' 
-          ? 'Face Not Visible' 
+        const violationMessage = type === 'face_not_visible'
+          ? 'Face Not Visible'
           : type === 'cell_phone'
           ? `Possible Phone Usage (${((score || 0) * 100).toFixed(1)}%)`
           : type === 'multiple_faces'
@@ -1255,7 +1278,24 @@ export default function App() {
           ? 'Possible Looking Away Violation'
           : 'Violation Detected'
         addLogEntry(violationMessage)
-        
+
+        // Bottom-left toast label — short form of the same violation, matching
+        // the "Warning/Amaran : <count> : <label>" convention.
+        const toastLabel = type === 'face_not_visible'
+          ? 'Face Not Visible'
+          : type === 'cell_phone'
+          ? 'Phone Usage'
+          : type === 'multiple_faces'
+          ? 'Multiple Faces'
+          : type === 'tab_switch'
+          ? 'Tab Switch'
+          : type === 'wrong_face'
+          ? 'Face Mismatch'
+          : type === 'eyes_off_screen'
+          ? 'Looking Away'
+          : 'Violation'
+        pushWarningToast(type, toastLabel)
+
         return newViolations
       })
     } else {
@@ -1279,7 +1319,7 @@ export default function App() {
       addLogEntry(violationMessage)
       
     }
-  }, [addLogEntry])
+  }, [addLogEntry, pushWarningToast])
 
   const loadMediaPipeModels = async () => {
     try {
@@ -1520,31 +1560,6 @@ export default function App() {
                 `Face Detected`,
                 15,
                 35
-              )
-            }
-            
-            // Display cell phone detection count at bottom (only count detections with >=42% confidence)
-            const cellPhoneCount = objectResults.detections ? 
-              objectResults.detections.filter(detection => {
-                if (!detection.categories || detection.categories.length === 0) return false
-                const category = detection.categories[0]
-                const categoryLower = category.categoryName.toLowerCase()
-                const isPhone = categoryLower.includes('cell phone') || 
-                               categoryLower.includes('phone') ||
-                               categoryLower.includes('mobile') ||
-                               categoryLower === 'cell phone'
-                return isPhone && category.score >= 0.42
-              }).length : 0
-            
-            if (showPhoneOverlayRef.current && cellPhoneCount > 0) {
-              ctx.fillStyle = 'rgba(255, 0, 255, 0.7)'
-              ctx.fillRect(10, videoHeight - 50, 250, 40)
-              ctx.fillStyle = '#ffffff'
-              ctx.font = 'bold 14px Arial'
-              ctx.fillText(
-                `Cell phones detected: ${cellPhoneCount}`,
-                15,
-                videoHeight - 25
               )
             }
 
@@ -2501,6 +2516,22 @@ export default function App() {
                   className="absolute top-0 left-0 w-full h-full pointer-events-none"
                   style={{ zIndex: 10 }}
                 />
+                {/* Warning toaster — bottom-left, replaces the old on-canvas detection labels */}
+                <div
+                  className="absolute bottom-3 left-3 flex flex-col gap-2 pointer-events-none"
+                  style={{ zIndex: 20 }}
+                >
+                  {warningToasts.map(t => (
+                    <div
+                      key={t.id}
+                      className="flex items-center gap-2 rounded-md bg-white px-4 py-2.5 text-sm shadow-lg animate-in fade-in slide-in-from-left-2"
+                    >
+                      <span className="font-semibold text-slate-900">Warning/Amaran</span>
+                      <span className="text-slate-400">:</span>
+                      <span className="text-slate-700">{t.label}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
             </CardContent>
           </Card>
