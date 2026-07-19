@@ -2526,7 +2526,7 @@ export default function App() {
                   {warningToasts.map(t => (
                     <div
                       key={t.id}
-                      className="flex items-center gap-1.5 rounded-lg bg-white/10 px-2.5 py-1.5 text-xs shadow-[0_8px_32px_rgba(0,0,0,0.12),0_0_0_1px_rgba(0,0,0,0.06),inset_0_1px_0_rgba(255,255,255,0.4)] backdrop-blur-md backdrop-saturate-150 animate-in fade-in slide-in-from-left-2 pointer-events-auto"
+                      className="flex items-center gap-1 rounded-md bg-white/10 px-1.5 py-1 text-[10px] shadow-[0_8px_32px_rgba(0,0,0,0.12),0_0_0_1px_rgba(0,0,0,0.06),inset_0_1px_0_rgba(255,255,255,0.4)] backdrop-blur-md backdrop-saturate-150 animate-in fade-in slide-in-from-left-2 pointer-events-auto"
                     >
                       <span className="font-semibold text-red-600">Warning/Amaran</span>
                       <span className="text-slate-400">:</span>
@@ -2534,10 +2534,10 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => setWarningToasts(prev => prev.filter(w => w.id !== t.id))}
-                        className="ml-1.5 shrink-0 rounded-sm p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors"
+                        className="ml-1 shrink-0 rounded-sm p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors"
                         aria-label="Dismiss warning"
                       >
-                        <X className="h-3 w-3" />
+                        <X className="h-2.5 w-2.5" />
                       </button>
                     </div>
                   ))}
