@@ -1281,8 +1281,10 @@ export default function App() {
         // only, not duration-extension updates) combined reach the threshold
         if ((type === 'face_not_visible' || type === 'tab_switch') && !hasAutoClosedExamModalRef.current) {
           criticalViolationOccurrenceCountRef.current += 1
+          console.log(`[AutoClose] Critical violation count: ${criticalViolationOccurrenceCountRef.current}/${CRITICAL_VIOLATION_AUTO_CLOSE_THRESHOLD} (type: ${type})`)
           if (criticalViolationOccurrenceCountRef.current >= CRITICAL_VIOLATION_AUTO_CLOSE_THRESHOLD) {
             hasAutoClosedExamModalRef.current = true
+            console.log('[AutoClose] Threshold reached — calling closeExamModal()')
             closeExamModal()
           }
         }
