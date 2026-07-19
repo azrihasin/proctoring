@@ -422,7 +422,7 @@ export default function App() {
   // API function to send log event
   const sendLogToAPI = useCallback(async (eventType: string, timestamp: Date) => {
     if (!sessionIdRef.current) {
-      console.warn('⚠️ No session ID available, skipping API call')
+      // console.warn('⚠️ No session ID available, skipping API call')
       return
     }
 
@@ -546,6 +546,7 @@ export default function App() {
       hour12: true
     })
     const logMessage = `${timestamp} ${message}`
+    console.log(`🚨 ${logMessage}`)
     setLogEntries(prev => [...prev.slice(-99), logMessage]) // Keep last 100 entries
 
     // Send the violation event to the API at most once per cooldown window per
@@ -570,7 +571,7 @@ export default function App() {
     endTime: Date
   ) => {
     if (!sessionIdRef.current) {
-      console.warn('⚠️ No session ID available, skipping API call')
+      // console.warn('⚠️ No session ID available, skipping API call')
       return
     }
 
