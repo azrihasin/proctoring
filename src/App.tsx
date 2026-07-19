@@ -8,7 +8,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
 import { VideoPreview } from '@/components/VideoPreview'
 import { fixWebmMetadata, cn } from '@/lib/utils'
-import { closeExamModal } from '@/lib/parentMessenger'
+import { sendEventToParent } from '@/lib/parentMessenger'
 import { Layers, Check, Download, X } from 'lucide-react'
 import axios from 'axios'
 import { useFaceProctoring } from '@/proctoring/useFaceProctoring'
@@ -290,6 +290,8 @@ export default function App() {
   }, [isOverlayMenuOpen])
   const [logEntries, setLogEntries] = useState<string[]>([])
   const [isViewVisible] = useState(true) // Toggle visibility for camera, log, and recorded list (toggle button hidden from UI)
+  // Log Section is hidden by default; pass ?debug=true in the URL to display it
+  const [isDebugMode] = useState(() => new URLSearchParams(window.location.search).get('debug') === 'true')
   
   // Recorded videos list
   const [recordedVideos, setRecordedVideos] = useState<RecordedVideo[]>([])
@@ -925,12 +927,12 @@ export default function App() {
         rollingBufferRef.current = []
 
         // Let the host exam application close the modal that embeds this app
-        closeExamModal()
+        sendEventToParent('modal-close', 'close-exam-modal')
     } catch (error) {
       console.error('Error ending exam:', error)
       setIsExamActive(false)
       setRecordingDuration(0)
-      closeExamModal()
+      sendEventToParent('modal-close', 'close-exam-modal')
     }
   }, [isExamActive, recordingDuration, saveVideo, addLogEntry, addRecordedVideo, getBestMimeType, stopExamRecording, stopViolationRecordingHook, violationRecordingStatus])
 
@@ -1284,8 +1286,8 @@ export default function App() {
           console.log(`[AutoClose] Critical violation count: ${criticalViolationOccurrenceCountRef.current}/${CRITICAL_VIOLATION_AUTO_CLOSE_THRESHOLD} (type: ${type})`)
           if (criticalViolationOccurrenceCountRef.current >= CRITICAL_VIOLATION_AUTO_CLOSE_THRESHOLD) {
             hasAutoClosedExamModalRef.current = true
-            console.log('[AutoClose] Threshold reached — calling closeExamModal()')
-            closeExamModal()
+            console.log('[AutoClose] Threshold reached — calling sendEventToParent()')
+            sendEventToParent('modal-close', 'close-exam-modal')
           }
         }
 
@@ -1310,7 +1312,7 @@ export default function App() {
         const toastLabel = type === 'face_not_visible'
           ? 'Face Not Visible'
           : type === 'cell_phone'
-          ? 'Phone Usage'
+          ? 'Potential prohibited object detected'
           : type === 'multiple_faces'
           ? 'Multiple Faces'
           : type === 'tab_switch'
@@ -1367,10 +1369,13 @@ export default function App() {
       
       faceDetectorRef.current = faceDetector
       
-      // Load Object Detector for smartphone detection
+      // Load Object Detector for smartphone detection. EfficientDet-Lite2 is
+      // the highest-accuracy variant MediaPipe hosts for this task (Lite3+
+      // isn't published) - swapped from Lite0 because weaker webcams/lighting
+      // were producing sub-threshold confidence and missing real phones.
       const objectDetector = await ObjectDetector.createFromOptions(vision, {
         baseOptions: {
-          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float16/1/efficientdet_lite2.tflite',
           delegate: 'GPU'
         },
         runningMode: 'VIDEO',
@@ -2521,7 +2526,7 @@ export default function App() {
                   {warningToasts.map(t => (
                     <div
                       key={t.id}
-                      className="flex items-center gap-2 rounded-md bg-white px-4 py-2.5 text-sm shadow-lg animate-in fade-in slide-in-from-left-2 pointer-events-auto"
+                      className="flex items-center gap-1.5 rounded-lg bg-white/10 px-2.5 py-1.5 text-xs shadow-[0_8px_32px_rgba(0,0,0,0.12),0_0_0_1px_rgba(0,0,0,0.06),inset_0_1px_0_rgba(255,255,255,0.4)] backdrop-blur-md backdrop-saturate-150 animate-in fade-in slide-in-from-left-2 pointer-events-auto"
                     >
                       <span className="font-semibold text-red-600">Warning/Amaran</span>
                       <span className="text-slate-400">:</span>
@@ -2529,10 +2534,10 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => setWarningToasts(prev => prev.filter(w => w.id !== t.id))}
-                        className="ml-2 shrink-0 rounded-sm p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors"
+                        className="ml-1.5 shrink-0 rounded-sm p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors"
                         aria-label="Dismiss warning"
                       >
-                        <X className="h-3.5 w-3.5" />
+                        <X className="h-3 w-3" />
                       </button>
                     </div>
                   ))}
@@ -2547,8 +2552,8 @@ export default function App() {
             textarea of throttled violation/session events (see addLogEntry);
             the overlay-toggle menu here only controls which detection
             overlays draw on the webcam canvas, it does not affect what gets
-            logged. Commented out for now. */}
-        {false && isViewVisible && (
+            logged. Shown when ?debug=true is present in the URL. */}
+        {isDebugMode && isViewVisible && (
           <div className="rounded-lg bg-[#f5f5f5] flex flex-col">
             <CardHeader className="flex-row items-center justify-between gap-2 space-y-0 py-3">
               <div className="flex items-center gap-2 flex-wrap">

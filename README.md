@@ -29,3 +29,27 @@ A browser-based, webcam-driven exam proctoring application. It watches a candida
 | **Possible Looking Away Violation (Eyes Off Screen)** | The candidate's gaze/head pose indicates they are looking away from the screen for a sustained period, rather than briefly glancing away. |
 
 Each violation type is tracked independently, with its own on-screen warning, log entry, recorded clip, and reported event.
+
+## Detection Models
+
+Detection runs entirely client-side in [src/App.tsx](src/App.tsx), using three independently loaded
+MediaPipe Tasks Vision models plus two checks that don't require a model. Each violation type uses
+its own model — swapping one does not affect the others.
+
+| Violation | Detection method | Model |
+|---|---|---|
+| Cell Phone | MediaPipe `ObjectDetector` — object must be classified as a phone category (`cell phone` / `phone` / `mobile phone` / `smartphone`) with confidence `>= 0.42`, sustained for 2 consecutive frames, with an 800ms debounce between repeat triggers | **EfficientDet-Lite2** (float16, GPU delegate) |
+| Multiple Faces / Face Not Visible | MediaPipe `FaceDetector`, minimum detection confidence 0.6 | BlazeFace short-range |
+| Eyes Off Screen | MediaPipe `FaceLandmarker` — head pose (yaw/pitch from the facial transformation matrix) + gaze blendshapes | Face Landmarker (blendshapes + facial transformation matrix) |
+| Tab Switch | Browser visibility/blur events | n/a — no ML model |
+| Face Mismatch (Wrong Face) | face-api.js, in [src/proctoring/useFaceProctoring.ts](src/proctoring/useFaceProctoring.ts) | face-api.js models |
+
+There is no rule engine layered on top of the object detector for phone detection — no hand-overlap,
+gaze-toward-object, or geometry gates. A single object-detector confidence pass above threshold is
+what confirms a Cell Phone violation.
+
+**Cell-phone model choice:** the object detector uses EfficientDet-Lite2, the highest-accuracy
+variant MediaPipe publishes for the Object Detector task (Lite0 is the only other option Google
+hosts; Lite3+ is not published). Lite2 replaced the previously-used Lite0 after under-detection was
+observed on lower-quality webcams/lighting, where Lite0's confidence scores fell under the 0.42
+threshold for real phones.
