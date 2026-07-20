@@ -66,7 +66,7 @@ value (`getEventTypeFromDetectionType` in [src/App.tsx](src/App.tsx)) so they al
   `window.addEventListener('message', ...)` and reads `event.data.eventType` /
   `event.data.message`.
 
-| Violation (`DetectionType`) | `eventType` (sent to both) | Sent to API (`eventType` in POST body) | `message` in postMessage |
+| Violation (`DetectionType`) | Sent to API (`eventType` in POST body) | `eventType` in postMessage | `message` in postMessage |
 |---|---|---|---|
 | Cell Phone (`potential_prohibited_object`) | `potential-prohibited-object` | `potential-prohibited-object` | `Potential prohibited object detected` |
 | Face Not Visible (`face_not_visible`) | `face-not-visible` | `face-not-visible` | `Face Not Visible` |
