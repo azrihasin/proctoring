@@ -66,11 +66,11 @@ value (`getEventTypeFromDetectionType` in [src/App.tsx](src/App.tsx)) so they al
   `window.addEventListener('message', ...)` and reads `event.data.eventType` /
   `event.data.message`.
 
-| Violation (`DetectionType`) | `eventType` (sent to both) | `message` in postMessage |
-|---|---|---|
-| Cell Phone (`potential_prohibited_object`) | `potential-prohibited-object` | `Potential prohibited object detected` |
-| Face Not Visible (`face_not_visible`) | `face-not-visible` | `Face Not Visible` |
-| Multiple Faces Detected (`multiple_faces`) | `multiple-faces` | `Multiple Faces` |
-| Tab Switch Detected (`tab_switch`) | `tab-switch` | `Tab Switch` |
-| Face Mismatch (`wrong_face`) | `face-mismatch` | `Face Mismatch` |
-| Eyes Off Screen (`eyes_off_screen`) | `eyes-off-screen` | `Looking Away` |
+| Violation (`DetectionType`) | `eventType` (sent to both) | Sent to API (`eventType` in POST body) | `message` in postMessage |
+|---|---|---|---|
+| Cell Phone (`potential_prohibited_object`) | `potential-prohibited-object` | `potential-prohibited-object` | `Potential prohibited object detected` |
+| Face Not Visible (`face_not_visible`) | `face-not-visible` | `face-not-visible` | `Face Not Visible` |
+| Multiple Faces Detected (`multiple_faces`) | `multiple-faces` | `multiple-faces` | `Multiple Faces` |
+| Tab Switch Detected (`tab_switch`) | `tab-switch` | `tab-switch` | `Tab Switch` |
+| Face Mismatch (`wrong_face`) | `face-mismatch` | `face-mismatch` | `Face Mismatch` |
+| Eyes Off Screen (`eyes_off_screen`) | `eyes-off-screen` | `eyes-off-screen` | `Looking Away` |
