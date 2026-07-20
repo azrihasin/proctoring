@@ -53,3 +53,24 @@ variant MediaPipe publishes for the Object Detector task (Lite0 is the only othe
 hosts; Lite3+ is not published). Lite2 replaced the previously-used Lite0 after under-detection was
 observed on lower-quality webcams/lighting, where Lite0's confidence scores fell under the 0.42
 threshold for real phones.
+
+## Event Reporting
+
+Every violation is reported to two independent destinations, both driven from the same `eventType`
+value (`getEventTypeFromDetectionType` in [src/App.tsx](src/App.tsx)) so they always agree:
+
+- **Backend API** — `POST https://proctor-x-api.appricode.net/api/proctor/event` with
+  `{ sessionId, timestamp, eventType }`.
+- **Host application** — `window.parent.postMessage({ type: 'violation', eventType, message }, '*')`,
+  sent from [src/lib/parentMessenger.ts](src/lib/parentMessenger.ts). The host listens with
+  `window.addEventListener('message', ...)` and reads `event.data.eventType` /
+  `event.data.message`.
+
+| Violation (`DetectionType`) | `eventType` (sent to both) | `message` in postMessage |
+|---|---|---|
+| Cell Phone (`potential_prohibited_object`) | `potential-prohibited-object` | `Potential prohibited object detected` |
+| Face Not Visible (`face_not_visible`) | `face-not-visible` | `Face Not Visible` |
+| Multiple Faces Detected (`multiple_faces`) | `multiple-faces` | `Multiple Faces` |
+| Tab Switch Detected (`tab_switch`) | `tab-switch` | `Tab Switch` |
+| Face Mismatch (`wrong_face`) | `face-mismatch` | `Face Mismatch` |
+| Eyes Off Screen (`eyes_off_screen`) | `eyes-off-screen` | `Looking Away` |
