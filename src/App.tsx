@@ -1324,6 +1324,10 @@ export default function App() {
           : 'Violation'
         pushWarningToast(type, toastLabel)
 
+        // Notify the host exam application of every logged violation,
+        // using the same short label shown in the toast.
+        sendEventToParent('violation', `${type}:${toastLabel}`)
+
         return newViolations
       })
     } else {
@@ -1345,7 +1349,10 @@ export default function App() {
       // Add log entry
       const violationMessage = 'Violation Detected'
       addLogEntry(violationMessage)
-      
+
+      // Notify the host exam application of every logged violation
+      sendEventToParent('violation', `${type}:${violationMessage}`)
+
     }
   }, [addLogEntry, pushWarningToast])
 

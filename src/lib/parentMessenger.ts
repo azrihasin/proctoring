@@ -10,6 +10,11 @@ function isEmbedded(): boolean {
 
 /** Posts a namespaced 'proctor-event:<type>:<message>' string to the parent window. */
 export function sendEventToParent(type: string, message: string): void {
-  if (!isEmbedded()) return
-  window.parent.postMessage('proctor-event:' + type + ':' + message, TARGET_ORIGIN)
+  const payload = 'proctor-event:' + type + ':' + message
+  if (!isEmbedded()) {
+    console.log('[parentMessenger] not embedded — skipped sending:', payload)
+    return
+  }
+  console.log('[parentMessenger] posting to parent:', payload)
+  window.parent.postMessage(payload, TARGET_ORIGIN)
 }
