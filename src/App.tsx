@@ -14,7 +14,7 @@ import axios from 'axios'
 import { useFaceProctoring } from '@/proctoring/useFaceProctoring'
 // import EKYC from '@/components/EKYC'
 
-type DetectionType = 'cell_phone' | 'multiple_faces' | 'face_not_visible' | 'tab_switch' | 'wrong_face' | 'eyes_off_screen' | null
+type DetectionType = 'potential_prohibited_object' | 'multiple_faces' | 'face_not_visible' | 'tab_switch' | 'wrong_face' | 'eyes_off_screen' | null
 
 type DetectionHistoryEntry = {
   type: DetectionType
@@ -43,11 +43,6 @@ type SavedVideo = {
 // it is visible, so without this we would hit /event and /upload continuously.
 // One event + one 10s clip per type per window is plenty for review.
 const VIOLATION_COOLDOWN_MS = 30000 // 30 seconds
-
-// Combined face_not_visible + tab_switch occurrence count that auto-closes the
-// exam modal in the host app (via closeExamModal) — counts new violation
-// episodes only, not duration-extension updates of an already-active one.
-const CRITICAL_VIOLATION_AUTO_CLOSE_THRESHOLD = 7
 
 // Episode grace period. A violation re-fires every detection frame while it is
 // visible but can also briefly drop out (a face turning, a phone moving out of
@@ -118,17 +113,15 @@ export default function App() {
   const faceLandmarkerRef = useRef<FaceLandmarker | null>(null) // Head-pose + eye-gaze for eyes_off_screen
   const detectionIntervalRef = useRef<number | null>(null) // Store interval ID for detection
   
-  const cellPhoneDetectionDebounceRef = useRef<number | null>(null) // For debounce
-  const lastCellPhoneDetectionTimeRef = useRef<number>(0)
+  const potentialProhibitedObjectDetectionDebounceRef = useRef<number | null>(null) // For debounce
+  const lastPotentialProhibitedObjectDetectionTimeRef = useRef<number>(0)
   const latestDetectionScoreRef = useRef<{ type: DetectionType; score: number } | null>(null) // Store latest detection score for violations
   const [detectionHistory, setDetectionHistory] = useState<DetectionHistoryEntry[]>([])
   const activeFaceNotVisibleViolationRef = useRef<number | null>(null) // Index of active face_not_visible violation in violations array
-  const activeCellPhoneViolationRef = useRef<number | null>(null) // Index of active cell_phone violation in violations array
+  const activePotentialProhibitedObjectViolationRef = useRef<number | null>(null) // Index of active potential_prohibited_object violation in violations array
   const activeMultipleFacesViolationRef = useRef<number | null>(null) // Index of active multiple_faces violation in violations array
   const activeTabSwitchViolationRef = useRef<number | null>(null) // Index of active tab_switch violation in violations array
   const activeWrongFaceViolationRef = useRef<number | null>(null) // Index of active wrong_face violation in violations array
-  const criticalViolationOccurrenceCountRef = useRef(0) // Combined count of face_not_visible + tab_switch occurrences (new-violation events only, not duration updates)
-  const hasAutoClosedExamModalRef = useRef(false) // Guard so the auto-close threshold only fires once per session
   const activeEyesOffScreenViolationRef = useRef<number | null>(null) // Index of active eyes_off_screen violation in violations array
 
   // Bottom-left warning toaster (replaces the old on-canvas detection labels).
@@ -474,7 +467,7 @@ export default function App() {
   const getEventTypeFromMessage = useCallback((message: string): string | null => {
     const messageLower = message.toLowerCase()
     if (messageLower.includes('cell phone') || messageLower.includes('phone')) {
-      return 'phone'
+      return 'potential-prohibited-object'
     } else if (messageLower.includes('face not visible') || messageLower.includes('face-not-visible')) {
       return 'face-not-visible'
     } else if (messageLower.includes('multiple faces') || messageLower.includes('multiple-faces')) {
@@ -491,8 +484,8 @@ export default function App() {
 
   // Map DetectionType to eventType format
   const getEventTypeFromDetectionType = useCallback((detectionType: DetectionType): string | null => {
-    if (detectionType === 'cell_phone') {
-      return 'phone'
+    if (detectionType === 'potential_prohibited_object') {
+      return 'potential-prohibited-object'
     } else if (detectionType === 'face_not_visible') {
       return 'face-not-visible'
     } else if (detectionType === 'multiple_faces') {
@@ -519,14 +512,18 @@ export default function App() {
     lastVideoUploadRef.current.delete(detectionType)
   }, [getEventTypeFromDetectionType])
 
-  // Add log entry helper with throttling for repeating logs
-  const addLogEntry = useCallback((message: string) => {
+  // Add log entry helper with throttling for repeating logs.
+  // eventTypeOverride, when provided, is the authoritative DetectionType->eventType
+  // mapping (see getEventTypeFromDetectionType) — this is also the value used in the
+  // postMessage sent to the parent, so the two stay in sync. Falls back to sniffing
+  // the message text only for the generic/unknown-type path.
+  const addLogEntry = useCallback((message: string, eventTypeOverride?: string | null) => {
     // Only add logs when exam is active
     if (!isExamActiveRef.current) {
       return
     }
 
-    const eventType = getEventTypeFromMessage(message)
+    const eventType = eventTypeOverride !== undefined ? eventTypeOverride : getEventTypeFromMessage(message)
 
     // Throttle the visible log by a STABLE key. Some messages embed changing
     // text (e.g. the cell-phone confidence "%"), which would otherwise produce a
@@ -755,7 +752,7 @@ export default function App() {
       setLogEntries([]) // Clear all logs when exam starts
       lastLogTimeRef.current.clear() // Clear log throttle map when exam starts
       activeFaceNotVisibleViolationRef.current = null // Reset active face_not_visible violation
-      activeCellPhoneViolationRef.current = null // Reset active cell_phone violation
+      activePotentialProhibitedObjectViolationRef.current = null // Reset active potential_prohibited_object violation
       activeMultipleFacesViolationRef.current = null // Reset active multiple_faces violation
       activeTabSwitchViolationRef.current = null // Reset active tab_switch violation
       activeWrongFaceViolationRef.current = null // Reset active wrong_face violation
@@ -925,14 +922,10 @@ export default function App() {
         examVideoChunksRef.current = []
         examChunkRecorderRef.current = null
         rollingBufferRef.current = []
-
-        // Let the host exam application close the modal that embeds this app
-        sendEventToParent('modal-close', 'close-exam-modal')
     } catch (error) {
       console.error('Error ending exam:', error)
       setIsExamActive(false)
       setRecordingDuration(0)
-      sendEventToParent('modal-close', 'close-exam-modal')
     }
   }, [isExamActive, recordingDuration, saveVideo, addLogEntry, addRecordedVideo, getBestMimeType, stopExamRecording, stopViolationRecordingHook, violationRecordingStatus])
 
@@ -985,7 +978,7 @@ export default function App() {
     // right away (with a progress bar) while the 10s clip is still recording.
     const pendingExt: 'mp4' | 'webm' = getBestMimeType().includes('webm') ? 'webm' : 'mp4'
     const pendingTimestamp = detectionTime.toISOString().replace(/[:.]/g, '-').slice(0, -5)
-    const pendingViolationTypeStr = violationType === 'cell_phone' ? 'cell_phone_detection' :
+    const pendingViolationTypeStr = violationType === 'potential_prohibited_object' ? 'potential_prohibited_object_detection' :
                                     violationType === 'multiple_faces' ? 'multiple_faces_detection' :
                                     violationType === 'face_not_visible' ? 'face_not_visible_detection' :
                                     violationType === 'tab_switch' ? 'tab_switch_detection' :
@@ -1088,7 +1081,7 @@ export default function App() {
 
           const baseExt: 'mp4' | 'webm' = currentMimeType.includes('webm') ? 'webm' : 'mp4'
           const timestamp = detectionTime.toISOString().replace(/[:.]/g, '-').slice(0, -5)
-          const violationTypeStr = currentViolationType === 'cell_phone' ? 'cell_phone_detection' :
+          const violationTypeStr = currentViolationType === 'potential_prohibited_object' ? 'potential_prohibited_object_detection' :
                                    currentViolationType === 'multiple_faces' ? 'multiple_faces_detection' :
                                    currentViolationType === 'face_not_visible' ? 'face_not_visible_detection' :
                                    currentViolationType === 'tab_switch' ? 'tab_switch_detection' :
@@ -1118,7 +1111,7 @@ export default function App() {
 
           // Map violation type to eventType format
           const eventTypeMap: Record<string, string> = {
-            'cell_phone': 'phone',
+            'potential_prohibited_object': 'potential-prohibited-object',
             'face_not_visible': 'face-not-visible',
             'multiple_faces': 'multiple-faces',
             'tab_switch': 'tab-switch',
@@ -1226,13 +1219,13 @@ export default function App() {
 
   // Add violation to list when detected
   const addViolation = useCallback((type: DetectionType, score?: number) => {
-    // For face_not_visible, cell_phone, multiple_faces, and tab_switch, track as duration - update existing or create new
-    if (type === 'face_not_visible' || type === 'cell_phone' || type === 'multiple_faces' || type === 'tab_switch' || type === 'wrong_face' || type === 'eyes_off_screen') {
+    // For face_not_visible, potential_prohibited_object, multiple_faces, and tab_switch, track as duration - update existing or create new
+    if (type === 'face_not_visible' || type === 'potential_prohibited_object' || type === 'multiple_faces' || type === 'tab_switch' || type === 'wrong_face' || type === 'eyes_off_screen') {
       setViolations(prev => {
         const activeRef = type === 'face_not_visible'
           ? activeFaceNotVisibleViolationRef
-          : type === 'cell_phone'
-          ? activeCellPhoneViolationRef
+          : type === 'potential_prohibited_object'
+          ? activePotentialProhibitedObjectViolationRef
           : type === 'multiple_faces'
           ? activeMultipleFacesViolationRef
           : type === 'tab_switch'
@@ -1279,22 +1272,10 @@ export default function App() {
         // Set the active index to the new violation
         activeRef.current = newViolations.length - 1
 
-        // Auto-close: face_not_visible + tab_switch occurrences (new violations
-        // only, not duration-extension updates) combined reach the threshold
-        if ((type === 'face_not_visible' || type === 'tab_switch') && !hasAutoClosedExamModalRef.current) {
-          criticalViolationOccurrenceCountRef.current += 1
-          console.log(`[AutoClose] Critical violation count: ${criticalViolationOccurrenceCountRef.current}/${CRITICAL_VIOLATION_AUTO_CLOSE_THRESHOLD} (type: ${type})`)
-          if (criticalViolationOccurrenceCountRef.current >= CRITICAL_VIOLATION_AUTO_CLOSE_THRESHOLD) {
-            hasAutoClosedExamModalRef.current = true
-            console.log('[AutoClose] Threshold reached — calling sendEventToParent()')
-            sendEventToParent('modal-close', 'close-exam-modal')
-          }
-        }
-
         // Add log entry
         const violationMessage = type === 'face_not_visible'
           ? 'Face Not Visible'
-          : type === 'cell_phone'
+          : type === 'potential_prohibited_object'
           ? `Possible Phone Usage (${((score || 0) * 100).toFixed(1)}%)`
           : type === 'multiple_faces'
           ? 'Multiple Faces Detected'
@@ -1305,13 +1286,16 @@ export default function App() {
           : type === 'eyes_off_screen'
           ? 'Possible Looking Away Violation'
           : 'Violation Detected'
-        addLogEntry(violationMessage)
+        // Authoritative eventType for this violation — the SAME value used for the
+        // DB event (sendLogToAPI) and the parent postMessage, so both stay in sync.
+        const eventType = getEventTypeFromDetectionType(type)
+        addLogEntry(violationMessage, eventType)
 
         // Bottom-left toast label — short form of the same violation, matching
         // the "Warning/Amaran : <count> : <label>" convention.
         const toastLabel = type === 'face_not_visible'
           ? 'Face Not Visible'
-          : type === 'cell_phone'
+          : type === 'potential_prohibited_object'
           ? 'Potential prohibited object detected'
           : type === 'multiple_faces'
           ? 'Multiple Faces'
@@ -1324,9 +1308,10 @@ export default function App() {
           : 'Violation'
         pushWarningToast(type, toastLabel)
 
-        // Notify the host exam application of every logged violation,
-        // using the same short label shown in the toast.
-        sendEventToParent('violation', `${type}:${toastLabel}`)
+        // Notify the host exam application of every logged violation, using the
+        // same eventType that was sent to the DB so the parent's payload matches
+        // the DB record.
+        sendEventToParent('violation', eventType, toastLabel)
 
         return newViolations
       })
@@ -1351,10 +1336,10 @@ export default function App() {
       addLogEntry(violationMessage)
 
       // Notify the host exam application of every logged violation
-      sendEventToParent('violation', `${type}:${violationMessage}`)
+      sendEventToParent('violation', getEventTypeFromDetectionType(type), violationMessage)
 
     }
-  }, [addLogEntry, pushWarningToast])
+  }, [addLogEntry, pushWarningToast, getEventTypeFromDetectionType])
 
   const loadMediaPipeModels = async () => {
     try {
@@ -1537,13 +1522,13 @@ export default function App() {
                 const categoryLower = categoryName.toLowerCase()
                 
                 // Check if this is a cell phone or phone-related object
-                const isCellPhone = categoryLower.includes('cell phone') || 
+                const isPotentialProhibitedObject = categoryLower.includes('cell phone') || 
                                    categoryLower.includes('phone') ||
                                    categoryLower.includes('mobile') ||
                                    categoryLower === 'cell phone'
                 
                 // ONLY draw and process cell phones with 42% or more confidence - ignore all other objects
-                if (!isCellPhone || category.score < 0.42) return
+                if (!isPotentialProhibitedObject || category.score < 0.42) return
                 
                 const bbox = detection.boundingBox
                 if (bbox) {
@@ -1602,8 +1587,8 @@ export default function App() {
             }
 
           // Detection thresholds for MediaPipe
-          const REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE = 2 // 2 frames (0.2 seconds) - smooth detection with higher confidence
-          const CELL_PHONE_DEBOUNCE_MS = 800 // 0.8 seconds debounce for smoother detection
+          const REQUIRED_CONSECUTIVE_DETECTIONS_POTENTIAL_PROHIBITED_OBJECT = 2 // 2 frames (0.2 seconds) - smooth detection with higher confidence
+          const POTENTIAL_PROHIBITED_OBJECT_DEBOUNCE_MS = 800 // 0.8 seconds debounce for smoother detection
           // Time-based gating for face-count violations (frame-count gating was
           // unreliable when the loop ran slower than 100ms/frame). Near-instant
           // alerting per requirement; raise to 500-800ms if too noisy.
@@ -1689,8 +1674,8 @@ export default function App() {
           let currentDetection: DetectionType = null
           
           // Detect smartphone using object detection
-          let isCellPhoneDetected = false
-          let cellPhoneScore = 0
+          let isPotentialProhibitedObjectDetected = false
+          let potentialProhibitedObjectScore = 0
           
           if (objectResults.detections && objectResults.detections.length > 0) {
             // Only check for cell phones - filter out all other objects
@@ -1711,8 +1696,8 @@ export default function App() {
                 
                 // Only consider detections with 42% or more confidence for smooth detection
                 if (isPhone && category.score >= 0.42) {
-                  isCellPhoneDetected = true
-                  cellPhoneScore = Math.max(cellPhoneScore, category.score)
+                  isPotentialProhibitedObjectDetected = true
+                  potentialProhibitedObjectScore = Math.max(potentialProhibitedObjectScore, category.score)
                   
                 }
               }
@@ -1720,30 +1705,30 @@ export default function App() {
           }
           
           // Keep the cell-phone episode alive while the phone is visible.
-          if (isCellPhoneDetected) lastSeenRef.current.set('cell_phone', Date.now())
+          if (isPotentialProhibitedObjectDetected) lastSeenRef.current.set('potential_prohibited_object', Date.now())
 
           // Set cell phone detection if phone detected
-          if (isCellPhoneDetected && !currentDetection) {
-            currentDetection = 'cell_phone'
-            latestDetectionScoreRef.current = { type: 'cell_phone', score: cellPhoneScore }
+          if (isPotentialProhibitedObjectDetected && !currentDetection) {
+            currentDetection = 'potential_prohibited_object'
+            latestDetectionScoreRef.current = { type: 'potential_prohibited_object', score: potentialProhibitedObjectScore }
             
             // Add to detection history
             setDetectionHistory(prev => {
               const updated = [
                 ...prev,
                 {
-                  type: 'cell_phone' as DetectionType,
+                  type: 'potential_prohibited_object' as DetectionType,
                   timestamp: new Date(),
-                  score: cellPhoneScore
+                  score: potentialProhibitedObjectScore
                 }
               ]
               return updated.slice(-100)
             })
-          } else if (!isCellPhoneDetected && activeCellPhoneViolationRef.current !== null) {
+          } else if (!isPotentialProhibitedObjectDetected && activePotentialProhibitedObjectViolationRef.current !== null) {
             // End cell phone violation if no longer detected (add 10 seconds after)
             setViolations(prev => {
-              const activeIndex = activeCellPhoneViolationRef.current
-              if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'cell_phone') {
+              const activeIndex = activePotentialProhibitedObjectViolationRef.current
+              if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'potential_prohibited_object') {
                 const updated = [...prev]
                 const currentTime = new Date()
                 updated[activeIndex] = {
@@ -1758,7 +1743,7 @@ export default function App() {
               }
               return prev
             })
-            activeCellPhoneViolationRef.current = null
+            activePotentialProhibitedObjectViolationRef.current = null
             // Episode close (resetEventDetectionCount) is deferred to the
             // EPISODE_GAP_MS sweep so a brief dropout doesn't re-fire event/upload.
           }
@@ -1847,7 +1832,7 @@ export default function App() {
           // --- eyes_off_screen: head-pose + eye-gaze (only when exactly ONE face) ---
           // The FaceLandmarker runs only for the normal single-face case, so it
           // adds no per-frame cost while a higher-priority face-count violation is
-          // active, and the !currentDetection guard keeps it below cell_phone.
+          // active, and the !currentDetection guard keeps it below potential_prohibited_object.
           if (faceCount === 1) noSingleFaceSinceRef.current = null
           if (faceCount === 1 && !currentDetection && faceLandmarkerRef.current) {
             let isEyesOff = false
@@ -2128,15 +2113,15 @@ export default function App() {
           // Track consecutive cell-phone detections to reduce false positives.
           // multiple_faces / face_not_visible are now fired directly above and
           // no longer flow through this consecutive-frame debounce.
-          const cellPhoneDetection: DetectionType = currentDetection === 'cell_phone' ? 'cell_phone' : null
-          if (cellPhoneDetection === detectionCountRef.current.type) {
+          const potentialProhibitedObjectDetection: DetectionType = currentDetection === 'potential_prohibited_object' ? 'potential_prohibited_object' : null
+          if (potentialProhibitedObjectDetection === detectionCountRef.current.type) {
             detectionCountRef.current.count++
           } else {
             // End active cell-phone violation if switching away (add 10 seconds after)
-            if (detectionCountRef.current.type === 'cell_phone' && activeCellPhoneViolationRef.current !== null) {
+            if (detectionCountRef.current.type === 'potential_prohibited_object' && activePotentialProhibitedObjectViolationRef.current !== null) {
               setViolations(prev => {
-                const activeIndex = activeCellPhoneViolationRef.current
-                if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'cell_phone') {
+                const activeIndex = activePotentialProhibitedObjectViolationRef.current
+                if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'potential_prohibited_object') {
                   const updated = [...prev]
                   const currentTime = new Date()
                   updated[activeIndex] = {
@@ -2147,29 +2132,29 @@ export default function App() {
                 }
                 return prev
               })
-              activeCellPhoneViolationRef.current = null
+              activePotentialProhibitedObjectViolationRef.current = null
               // Episode close deferred to the EPISODE_GAP_MS sweep.
             }
 
-            detectionCountRef.current.type = cellPhoneDetection
-            detectionCountRef.current.count = cellPhoneDetection ? 1 : 0
+            detectionCountRef.current.type = potentialProhibitedObjectDetection
+            detectionCountRef.current.count = potentialProhibitedObjectDetection ? 1 : 0
           }
 
           // Only trigger the cell-phone violation after required consecutive detections
           const confirmedDetection = detectionCountRef.current.type
           const hasEnoughConsecutiveDetections =
-            detectionCountRef.current.count >= REQUIRED_CONSECUTIVE_DETECTIONS_CELL_PHONE &&
-            confirmedDetection === 'cell_phone'
+            detectionCountRef.current.count >= REQUIRED_CONSECUTIVE_DETECTIONS_POTENTIAL_PROHIBITED_OBJECT &&
+            confirmedDetection === 'potential_prohibited_object'
 
           // For cell phones, also check debounce
           let shouldTriggerAlert: boolean = hasEnoughConsecutiveDetections
-          if (confirmedDetection === 'cell_phone' && hasEnoughConsecutiveDetections) {
+          if (confirmedDetection === 'potential_prohibited_object' && hasEnoughConsecutiveDetections) {
             const now = Date.now()
-            const timeSinceLastDetection = now - lastCellPhoneDetectionTimeRef.current
-            shouldTriggerAlert = timeSinceLastDetection >= CELL_PHONE_DEBOUNCE_MS
+            const timeSinceLastDetection = now - lastPotentialProhibitedObjectDetectionTimeRef.current
+            shouldTriggerAlert = timeSinceLastDetection >= POTENTIAL_PROHIBITED_OBJECT_DEBOUNCE_MS
           }
 
-          if (shouldTriggerAlert && confirmedDetection === 'cell_phone') {
+          if (shouldTriggerAlert && confirmedDetection === 'potential_prohibited_object') {
             // Start violation recording automatically (will be ignored if already recording this type)
             const streamToUse = getMediaStream()
             const examIsActive = isExamActiveRef.current || isExamActive // Check both ref and state
@@ -2178,26 +2163,26 @@ export default function App() {
               const detectionTime = new Date()
               // Fire and forget - violation recording runs in background
               // startViolationRecording will ignore if same type is already recording
-              startViolationRecording(streamToUse, detectionTime, 'cell_phone').catch((error) => {
+              startViolationRecording(streamToUse, detectionTime, 'potential_prohibited_object').catch((error) => {
                 console.error('Error starting violation recording:', error)
               })
             }
-            lastCellPhoneDetectionTimeRef.current = Date.now()
+            lastPotentialProhibitedObjectDetectionTimeRef.current = Date.now()
 
-            const violationScore = latestDetectionScoreRef.current?.type === 'cell_phone'
+            const violationScore = latestDetectionScoreRef.current?.type === 'potential_prohibited_object'
               ? latestDetectionScoreRef.current.score
               : undefined
-            addViolation('cell_phone', violationScore)
-          } else if (confirmedDetection === 'cell_phone' && activeCellPhoneViolationRef.current !== null) {
+            addViolation('potential_prohibited_object', violationScore)
+          } else if (confirmedDetection === 'potential_prohibited_object' && activePotentialProhibitedObjectViolationRef.current !== null) {
             setViolations(prev => {
-              const activeIndex = activeCellPhoneViolationRef.current
-              if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'cell_phone') {
+              const activeIndex = activePotentialProhibitedObjectViolationRef.current
+              if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'potential_prohibited_object') {
                 const updated = [...prev]
                 const currentTime = new Date()
                 updated[activeIndex] = {
                   ...updated[activeIndex],
                   endTime: new Date(currentTime.getTime() + 10000), // +10 seconds after detection ends
-                  score: latestDetectionScoreRef.current?.type === 'cell_phone'
+                  score: latestDetectionScoreRef.current?.type === 'potential_prohibited_object'
                     ? latestDetectionScoreRef.current.score
                     : updated[activeIndex].score
                 }
@@ -2374,9 +2359,9 @@ export default function App() {
         clearTimeout(recordingTimeoutRef.current)
         recordingTimeoutRef.current = null
       }
-      if (cellPhoneDetectionDebounceRef.current) {
-        clearTimeout(cellPhoneDetectionDebounceRef.current)
-        cellPhoneDetectionDebounceRef.current = null
+      if (potentialProhibitedObjectDetectionDebounceRef.current) {
+        clearTimeout(potentialProhibitedObjectDetectionDebounceRef.current)
+        potentialProhibitedObjectDetectionDebounceRef.current = null
       }
       
       // Clean up MediaPipe detectors

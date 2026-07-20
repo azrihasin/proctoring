@@ -1,6 +1,6 @@
 // Communicates with the host exam application this app is embedded into via <iframe>.
 // The host listens with window.addEventListener('message', ...) and expects
-// event.data to be a string of the form 'proctor-event:<type>:<message>'.
+// event.data to be an object of the form { type, eventType, message }.
 
 const TARGET_ORIGIN = '*'
 
@@ -8,9 +8,9 @@ function isEmbedded(): boolean {
   return typeof window !== 'undefined' && window.parent !== window
 }
 
-/** Posts a namespaced 'proctor-event:<type>:<message>' string to the parent window. */
-export function sendEventToParent(type: string, message: string): void {
-  const payload = 'proctor-event:' + type + ':' + message
+/** Posts a { type, eventType, message } object to the parent window. */
+export function sendEventToParent(type: string, eventType: string | null, message: string): void {
+  const payload = { type, eventType, message }
   if (!isEmbedded()) {
     console.log('[parentMessenger] not embedded — skipped sending:', payload)
     return
