@@ -52,6 +52,10 @@ const VIOLATION_COOLDOWN_MS = 30000 // 30 seconds
 // duplicate event/upload, while detection of the FIRST frame stays immediate.
 const EPISODE_GAP_MS = 3000 // 3 seconds
 
+// Kill switch for eyes_off_screen (looking-away) detection. Disabled for now;
+// set to true to re-enable. Other face/phone detections are unaffected.
+const ENABLE_EYES_OFF_SCREEN = false
+
 // Lifecycle of a recorded item in the list:
 // - 'pending'  : violation just detected, the 10s clip is still being recorded
 // - 'ready'    : clip captured, blob available, can be downloaded
@@ -1834,7 +1838,7 @@ export default function App() {
           // adds no per-frame cost while a higher-priority face-count violation is
           // active, and the !currentDetection guard keeps it below potential_prohibited_object.
           if (faceCount === 1) noSingleFaceSinceRef.current = null
-          if (faceCount === 1 && !currentDetection && faceLandmarkerRef.current) {
+          if (ENABLE_EYES_OFF_SCREEN && faceCount === 1 && !currentDetection && faceLandmarkerRef.current) {
             let isEyesOff = false
             let offMagnitude = 0
             let requiredHoldMs = EYES_OFF_SCREEN_HORIZONTAL_MS
@@ -2518,7 +2522,7 @@ export default function App() {
                   {warningToasts.map(t => (
                     <div
                       key={t.id}
-                      className="flex items-center gap-1 rounded-md bg-white/10 px-1.5 py-1 text-[10px] shadow-[0_8px_32px_rgba(0,0,0,0.12),0_0_0_1px_rgba(0,0,0,0.06),inset_0_1px_0_rgba(255,255,255,0.4)] backdrop-blur-md backdrop-saturate-150 animate-in fade-in slide-in-from-left-2 pointer-events-auto"
+                      className="flex items-center gap-1 rounded-md bg-white px-1.5 py-1 text-[10px] shadow-[0_8px_32px_rgba(0,0,0,0.12),0_0_0_1px_rgba(0,0,0,0.06)] animate-in fade-in slide-in-from-left-2 pointer-events-auto"
                     >
                       <span className="font-semibold text-red-600">Warning/Amaran</span>
                       <span className="text-slate-400">:</span>
