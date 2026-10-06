@@ -54,6 +54,13 @@ hosts; Lite3+ is not published). Lite2 replaced the previously-used Lite0 after 
 observed on lower-quality webcams/lighting, where Lite0's confidence scores fell under the 0.42
 threshold for real phones.
 
+## Language
+
+On-screen alerts (warning toast, camera errors) follow the `lang` URL parameter:
+`?lang=ms` for Bahasa Melayu, `?lang=en` for English. Missing or unknown values fall back to
+English. Strings live in [src/lib/i18n.ts](src/lib/i18n.ts). The API `eventType` and the
+postMessage `message` below are always English, regardless of `lang`.
+
 ## Event Reporting
 
 Every violation is reported to two independent destinations, both driven from the same `eventType`
