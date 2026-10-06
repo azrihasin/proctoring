@@ -9,6 +9,7 @@ import { Badge } from '@/components/ui/badge'
 import { VideoPreview } from '@/components/VideoPreview'
 import { fixWebmMetadata, cn } from '@/lib/utils'
 import { sendEventToParent } from '@/lib/parentMessenger'
+import { getLangFromUrl, STRINGS } from '@/lib/i18n'
 import { Layers, Check, Download, X } from 'lucide-react'
 import axios from 'axios'
 import { useFaceProctoring } from '@/proctoring/useFaceProctoring'
@@ -127,6 +128,11 @@ export default function App() {
   const activeTabSwitchViolationRef = useRef<number | null>(null) // Index of active tab_switch violation in violations array
   const activeWrongFaceViolationRef = useRef<number | null>(null) // Index of active wrong_face violation in violations array
   const activeEyesOffScreenViolationRef = useRef<number | null>(null) // Index of active eyes_off_screen violation in violations array
+
+  // UI language for on-screen alerts — ?lang=ms or ?lang=en (default English).
+  // See src/lib/i18n.ts; API/parent payloads stay in English.
+  const [lang] = useState(getLangFromUrl)
+  const t = STRINGS[lang]
 
   // Bottom-left warning toaster (replaces the old on-canvas detection labels).
   // One toast is pushed per NEW violation episode (never per frame — addViolation
@@ -415,14 +421,14 @@ export default function App() {
     const errorMessage = typeof error === 'string' ? error : error.message
     
     if (errorMessage.includes('NotAllowedError') || errorMessage.includes('Permission denied')) {
-      setWebcamError('Camera access denied. Please allow camera access in your browser settings.')
+      setWebcamError(t.cameraAccessDenied)
     } else if (errorMessage.includes('NotFoundError') || errorMessage.includes('No camera')) {
-      setWebcamError('No camera found. Please connect a camera and try again.')
+      setWebcamError(t.cameraNotFound)
     } else {
-      setWebcamError('Failed to access camera. Please check your camera permissions.')
+      setWebcamError(t.cameraFailed)
     }
     setWebcamReady(false)
-  }, [])
+  }, [t])
 
 
 
@@ -1295,8 +1301,8 @@ export default function App() {
         const eventType = getEventTypeFromDetectionType(type)
         addLogEntry(violationMessage, eventType)
 
-        // Bottom-left toast label — short form of the same violation, matching
-        // the "Warning/Amaran : <count> : <label>" convention.
+        // Short label for the parent postMessage — kept in English (host contract,
+        // see README "Event Reporting"). The on-screen toast uses the ?lang= text.
         const toastLabel = type === 'face_not_visible'
           ? 'Face Not Visible'
           : type === 'potential_prohibited_object'
@@ -1310,7 +1316,7 @@ export default function App() {
           : type === 'eyes_off_screen'
           ? 'Looking Away'
           : 'Violation'
-        pushWarningToast(type, toastLabel)
+        pushWarningToast(type, t.violations[type ?? 'default'] ?? t.violations.default)
 
         // Notify the host exam application of every logged violation, using the
         // same eventType that was sent to the DB so the parent's payload matches
@@ -1343,7 +1349,7 @@ export default function App() {
       sendEventToParent('violation', getEventTypeFromDetectionType(type), violationMessage)
 
     }
-  }, [addLogEntry, pushWarningToast, getEventTypeFromDetectionType])
+  }, [addLogEntry, pushWarningToast, getEventTypeFromDetectionType, t])
 
   const loadMediaPipeModels = async () => {
     try {
@@ -2479,10 +2485,10 @@ export default function App() {
             <div className="relative w-full aspect-video bg-black overflow-hidden">
                 {webcamError ? (
                   <div className="w-full h-full flex flex-col items-center justify-center text-white p-4">
-                    <p className="text-lg font-semibold mb-2">Camera Access Error</p>
+                    <p className="text-lg font-semibold mb-2">{t.cameraAccessError}</p>
                     <p className="text-sm text-center">{webcamError}</p>
                     <p className="text-xs text-center mt-2 text-gray-300">
-                      Please allow camera access and refresh the page.
+                      {t.cameraAllowAndRefresh}
                     </p>
                   </div>
                 ) : (
@@ -2504,7 +2510,7 @@ export default function App() {
                     />
                     {!webcamReady && !webcamError && (
                       <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-50 text-white">
-                        <p>Requesting camera access...</p>
+                        <p>{t.requestingCamera}</p>
                       </div>
                     )}
                   </>
@@ -2519,19 +2525,19 @@ export default function App() {
                   className="absolute bottom-3 left-3 flex flex-col gap-2 pointer-events-none"
                   style={{ zIndex: 20 }}
                 >
-                  {warningToasts.map(t => (
+                  {warningToasts.map(toast => (
                     <div
-                      key={t.id}
+                      key={toast.id}
                       className="flex items-center gap-1 rounded-md bg-white px-1.5 py-1 text-[10px] shadow-[0_8px_32px_rgba(0,0,0,0.12),0_0_0_1px_rgba(0,0,0,0.06)] animate-in fade-in slide-in-from-left-2 pointer-events-auto"
                     >
-                      <span className="font-semibold text-red-600">Warning/Amaran</span>
+                      <span className="font-semibold text-red-600">{t.warning}</span>
                       <span className="text-slate-400">:</span>
-                      <span className="text-slate-700">{t.label}</span>
+                      <span className="text-slate-700">{toast.label}</span>
                       <button
                         type="button"
-                        onClick={() => setWarningToasts(prev => prev.filter(w => w.id !== t.id))}
+                        onClick={() => setWarningToasts(prev => prev.filter(w => w.id !== toast.id))}
                         className="ml-1 shrink-0 rounded-sm p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors"
-                        aria-label="Dismiss warning"
+                        aria-label={t.dismissWarning}
                       >
                         <X className="h-2.5 w-2.5" />
                       </button>
