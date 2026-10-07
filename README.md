@@ -22,7 +22,7 @@ A browser-based, webcam-driven exam proctoring application. It watches a candida
 | Violation | Description |
 |---|---|
 | **Cell Phone / Possible Phone Usage** | A mobile phone is detected in view of the webcam, suggesting the candidate may be using it during the exam. |
-| **Face Not Visible** | No face can be detected in the webcam feed (e.g. candidate has stepped away, is out of frame, or the camera is obstructed). |
+| **Face Not Visible** | No face can be detected in the webcam feed (e.g. candidate has stepped away, is out of frame, or the camera is obstructed). Not checked at exam start until a face has been seen or 3 seconds have passed, so dark/blurry camera warm-up frames don't trigger it. |
 | **Multiple Faces Detected** | More than one face is detected in the frame, suggesting another person may be present with the candidate. |
 | **Tab Switch Detected** | The candidate has switched away from the exam browser tab/window. |
 | **Face Mismatch (Wrong Face) Detected** | The face currently on webcam does not match the candidate's verified KYC selfie, suggesting the exam may be taken by someone else. |
@@ -72,6 +72,11 @@ value (`getEventTypeFromDetectionType` in [src/App.tsx](src/App.tsx)) so they al
   sent from [src/lib/parentMessenger.ts](src/lib/parentMessenger.ts). The host listens with
   `window.addEventListener('message', ...)` and reads `event.data.eventType` /
   `event.data.message`.
+
+Both use the same per-type cooldown (`VIOLATION_COOLDOWN_MS`, 30s, reset once the violation has been
+gone for `EPISODE_GAP_MS`, 3s), so a detection that flickers on and off produces **one** postMessage
+and one toast, not one per flicker. The postMessage is sent immediately and never waits for the API
+response.
 
 | Violation (`DetectionType`) | Sent to API (`eventType` in POST body) | `eventType` in postMessage | `message` in postMessage |
 |---|---|---|---|
