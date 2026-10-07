@@ -53,6 +53,15 @@ const VIOLATION_COOLDOWN_MS = 30000 // 30 seconds
 // duplicate event/upload, while detection of the FIRST frame stays immediate.
 const EPISODE_GAP_MS = 3000 // 3 seconds
 
+// Camera warm-up grace at exam start. The exam auto-starts the moment the webcam
+// stream is granted, but the first frames are often black/dark/blurry while the
+// camera adjusts exposure and focus, so the face detector sees 0 faces and
+// face_not_visible would fire within the first second of every session.
+// face_not_visible is only armed once a face has been seen OR this much time has
+// passed since exam start, whichever comes first — so a candidate who never
+// shows up is still flagged.
+const FACE_NOT_VISIBLE_STARTUP_GRACE_MS = 3000 // 3 seconds
+
 // Kill switch for eyes_off_screen (looking-away) detection. Disabled for now;
 // set to true to re-enable. Other face/phone detections are unaffected.
 const ENABLE_EYES_OFF_SCREEN = false
@@ -95,6 +104,8 @@ export default function App() {
   const detectionCountRef = useRef<{ type: DetectionType; count: number }>({ type: null, count: 0 })
   const faceNotVisibleSinceRef = useRef<number | null>(null) // Timestamp when face first became not visible
   const multipleFacesSinceRef = useRef<number | null>(null) // Timestamp when multiple faces first appeared
+  const examStartedAtRef = useRef<number | null>(null) // Exam start time, for the face_not_visible warm-up grace
+  const faceSeenSinceExamStartRef = useRef(false) // Whether any face has been detected since the exam started
   const eyesOffScreenSinceRef = useRef<number | null>(null) // Timestamp when the candidate first looked away
   const eyesOnGraceStartRef = useRef<number | null>(null) // First moment of continuous on-screen/no-face evidence; the look-away hold only resets after this persists (flicker tolerance)
   const noSingleFaceSinceRef = useRef<number | null>(null) // First moment faceCount stopped being exactly 1; baseline only drops after a sustained absence
@@ -135,10 +146,9 @@ export default function App() {
   const t = STRINGS[lang]
 
   // Bottom-left warning toaster (replaces the old on-canvas detection labels).
-  // One toast is pushed per NEW violation episode (never per frame — addViolation
-  // only reaches the "create new violation" branch once per episode thanks to the
-  // active*ViolationRef gating above), so this stays in sync with the same
-  // episode boundaries the recording/log pipeline already uses.
+  // One toast is pushed per LOGGED violation (never per frame or per detection
+  // flicker — addViolation only pushes when addLogEntry passed its cooldown), so
+  // the toast, the parent postMessage and the DB event always tally.
   const [warningToasts, setWarningToasts] = useState<Array<{ id: string; type: DetectionType; label: string; count: number }>>([])
   const violationOccurrenceCountRef = useRef<Map<DetectionType, number>>(new Map())
   const MAX_VISIBLE_TOASTS = 1
@@ -527,10 +537,12 @@ export default function App() {
   // mapping (see getEventTypeFromDetectionType) — this is also the value used in the
   // postMessage sent to the parent, so the two stay in sync. Falls back to sniffing
   // the message text only for the generic/unknown-type path.
-  const addLogEntry = useCallback((message: string, eventTypeOverride?: string | null) => {
+  // Returns true only when the entry was actually logged (exam active and outside
+  // the cooldown window) — callers use this to gate the toast/parent notification.
+  const addLogEntry = useCallback((message: string, eventTypeOverride?: string | null): boolean => {
     // Only add logs when exam is active
     if (!isExamActiveRef.current) {
-      return
+      return false
     }
 
     const eventType = eventTypeOverride !== undefined ? eventTypeOverride : getEventTypeFromMessage(message)
@@ -549,7 +561,7 @@ export default function App() {
 
     // For repeating logs, only show if the cooldown window has passed since last occurrence
     if (lastLogTime > 0 && now - lastLogTime < LOG_THROTTLE_INTERVAL_MS) {
-      return
+      return false
     }
     lastLogTimeRef.current.set(throttleKey, now)
 
@@ -578,6 +590,7 @@ export default function App() {
         })
       }
     }
+    return true
   }, [getEventTypeFromMessage, sendLogToAPI])
 
   // API function to send video
@@ -767,6 +780,10 @@ export default function App() {
       activeTabSwitchViolationRef.current = null // Reset active tab_switch violation
       activeWrongFaceViolationRef.current = null // Reset active wrong_face violation
       activeEyesOffScreenViolationRef.current = null // Reset active eyes_off_screen violation
+      faceNotVisibleSinceRef.current = null // Reset the face_not_visible gating timer (may be stale from pre-exam frames)
+      multipleFacesSinceRef.current = null // Reset the multiple_faces gating timer
+      examStartedAtRef.current = Date.now() // Start the face_not_visible camera warm-up grace
+      faceSeenSinceExamStartRef.current = false
       eyesOffScreenSinceRef.current = null // Reset the eyes_off_screen gating timer
       eyesOnGraceStartRef.current = null
       noSingleFaceSinceRef.current = null
@@ -1231,19 +1248,23 @@ export default function App() {
   const addViolation = useCallback((type: DetectionType, score?: number) => {
     // For face_not_visible, potential_prohibited_object, multiple_faces, and tab_switch, track as duration - update existing or create new
     if (type === 'face_not_visible' || type === 'potential_prohibited_object' || type === 'multiple_faces' || type === 'tab_switch' || type === 'wrong_face' || type === 'eyes_off_screen') {
+      const activeRef = type === 'face_not_visible'
+        ? activeFaceNotVisibleViolationRef
+        : type === 'potential_prohibited_object'
+        ? activePotentialProhibitedObjectViolationRef
+        : type === 'multiple_faces'
+        ? activeMultipleFacesViolationRef
+        : type === 'tab_switch'
+        ? activeTabSwitchViolationRef
+        : type === 'wrong_face'
+        ? activeWrongFaceViolationRef
+        : activeEyesOffScreenViolationRef
+
+      // Decided OUTSIDE the state updater: React may run an updater more than once
+      // (StrictMode always does in dev), so side effects inside it would fire twice.
+      const startsNewViolation = activeRef.current === null
+
       setViolations(prev => {
-        const activeRef = type === 'face_not_visible'
-          ? activeFaceNotVisibleViolationRef
-          : type === 'potential_prohibited_object'
-          ? activePotentialProhibitedObjectViolationRef
-          : type === 'multiple_faces'
-          ? activeMultipleFacesViolationRef
-          : type === 'tab_switch'
-          ? activeTabSwitchViolationRef
-          : type === 'wrong_face'
-          ? activeWrongFaceViolationRef
-          : activeEyesOffScreenViolationRef
-        
         // Check if there's an active violation of this type
         if (activeRef.current !== null) {
           const activeIndex = activeRef.current
@@ -1282,6 +1303,10 @@ export default function App() {
         // Set the active index to the new violation
         activeRef.current = newViolations.length - 1
 
+        return newViolations
+      })
+
+      if (startsNewViolation) {
         // Add log entry
         const violationMessage = type === 'face_not_visible'
           ? 'Face Not Visible'
@@ -1299,32 +1324,37 @@ export default function App() {
         // Authoritative eventType for this violation — the SAME value used for the
         // DB event (sendLogToAPI) and the parent postMessage, so both stay in sync.
         const eventType = getEventTypeFromDetectionType(type)
-        addLogEntry(violationMessage, eventType)
+        const logged = addLogEntry(violationMessage, eventType)
 
-        // Short label for the parent postMessage — kept in English (host contract,
-        // see README "Event Reporting"). The on-screen toast uses the ?lang= text.
-        const toastLabel = type === 'face_not_visible'
-          ? 'Face Not Visible'
-          : type === 'potential_prohibited_object'
-          ? 'Potential prohibited object detected'
-          : type === 'multiple_faces'
-          ? 'Multiple Faces'
-          : type === 'tab_switch'
-          ? 'Tab Switch'
-          : type === 'wrong_face'
-          ? 'Face Mismatch'
-          : type === 'eyes_off_screen'
-          ? 'Looking Away'
-          : 'Violation'
-        pushWarningToast(type, t.violations[type ?? 'default'] ?? t.violations.default)
+        // A flickering detection (e.g. the face lost for a few frames, back for
+        // one) starts a "new" violation on every flicker. Only notify when the
+        // log entry actually went through its cooldown — the same gate as the DB
+        // event — so the toast and the host see one notification per logged
+        // violation instead of one per flicker.
+        if (logged) {
+          // Short label for the parent postMessage — kept in English (host contract,
+          // see README "Event Reporting"). The on-screen toast uses the ?lang= text.
+          const toastLabel = type === 'face_not_visible'
+            ? 'Face Not Visible'
+            : type === 'potential_prohibited_object'
+            ? 'Potential prohibited object detected'
+            : type === 'multiple_faces'
+            ? 'Multiple Faces'
+            : type === 'tab_switch'
+            ? 'Tab Switch'
+            : type === 'wrong_face'
+            ? 'Face Mismatch'
+            : type === 'eyes_off_screen'
+            ? 'Looking Away'
+            : 'Violation'
+          pushWarningToast(type, t.violations[type ?? 'default'] ?? t.violations.default)
 
-        // Notify the host exam application of every logged violation, using the
-        // same eventType that was sent to the DB so the parent's payload matches
-        // the DB record.
-        sendEventToParent('violation', eventType, toastLabel)
-
-        return newViolations
-      })
+          // Notify the host exam application of every logged violation, using the
+          // same eventType that was sent to the DB so the parent's payload matches
+          // the DB record.
+          sendEventToParent('violation', eventType, toastLabel)
+        }
+      }
     } else {
       // For other violation types, create new entry as before
       const violationTime = new Date()
@@ -1343,10 +1373,12 @@ export default function App() {
       
       // Add log entry
       const violationMessage = 'Violation Detected'
-      addLogEntry(violationMessage)
+      const logged = addLogEntry(violationMessage)
 
       // Notify the host exam application of every logged violation
-      sendEventToParent('violation', getEventTypeFromDetectionType(type), violationMessage)
+      if (logged) {
+        sendEventToParent('violation', getEventTypeFromDetectionType(type), violationMessage)
+      }
 
     }
   }, [addLogEntry, pushWarningToast, getEventTypeFromDetectionType, t])
@@ -1355,7 +1387,7 @@ export default function App() {
     try {
       // Initialize MediaPipe vision tasks
       const vision = await FilesetResolver.forVisionTasks(
-        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/wasm'
       )
       
       // Load Face Detector with improved parameters
@@ -1799,8 +1831,16 @@ export default function App() {
             }
           }
 
+          // Camera warm-up grace — see FACE_NOT_VISIBLE_STARTUP_GRACE_MS. Until a
+          // face has been seen (or the grace has elapsed) a 0-face frame is most
+          // likely a dark/unfocused warm-up frame, not a missing candidate.
+          if (faceCount > 0) faceSeenSinceExamStartRef.current = true
+          const faceNotVisibleArmed = faceSeenSinceExamStartRef.current ||
+            examStartedAtRef.current === null ||
+            Date.now() - examStartedAtRef.current >= FACE_NOT_VISIBLE_STARTUP_GRACE_MS
+
           // Check for face not visible (time-based; only if nothing higher-priority detected)
-          if (faceCount === 0 && !currentDetection) {
+          if (faceCount === 0 && !currentDetection && faceNotVisibleArmed) {
             lastSeenRef.current.set('face_not_visible', Date.now())
             if (faceNotVisibleSinceRef.current === null) faceNotVisibleSinceRef.current = Date.now()
 
