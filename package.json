@@ -5,7 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "dev:sit": "vite --mode sit",
+    "dev:prod": "vite --mode production",
+    "build": "tsc && vite build --mode development",
+    "build:dev": "tsc && vite build --mode development",
+    "build:sit": "tsc && vite build --mode sit",
+    "build:prod": "tsc && vite build --mode production",
     "preview": "vite preview"
   },
   "devDependencies": {

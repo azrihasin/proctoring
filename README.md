@@ -2,6 +2,74 @@
 
 A browser-based, webcam-driven exam proctoring application. It watches a candidate through their webcam during an exam session, automatically detects suspicious behavior in real time, records short video clips of each incident, and reports both events and clips to a backend API for later review.
 
+## Getting Started
+
+### Prerequisites
+
+- Node.js 20.19+ or 22.12+ (required by Vite 7)
+- npm
+- A browser with webcam access (Chrome / Edge recommended)
+
+### Installation
+
+```bash
+git clone <repository-url>
+cd proctoring
+npm install
+```
+
+### Environment Configuration
+
+The backend API base URL is set at build time through `VITE_API_BASE_URL`. Each environment has its own `.env.[mode]` file:
+
+| File | Mode | API |
+|---|---|---|
+| `.env.development` | `development` | `https://proctor-dev.cidb.gov.my/api` |
+| `.env.sit` | `sit` | `https://proctor-sit.cidb.gov.my/api` |
+| `.env.production` | `production` | `https://proctor.cidb.gov.my/api` |
+
+An environment variable of the same name set in the shell or on the hosting platform (e.g. Vercel) takes precedence over the file. If `VITE_API_BASE_URL` is missing, the app throws on startup.
+
+### Running Locally
+
+```bash
+npm run dev        # development API
+npm run dev:sit    # SIT API
+npm run dev:prod   # production API
+```
+
+Then open the app with a session ID in the URL:
+
+```
+http://localhost:5173/?sessionId=<session-id>&userId=<user-id>
+```
+
+| Parameter | Required | Description |
+|---|---|---|
+| `sessionId` | Yes* | Exam session ID. Falls back to `idNo` if absent. |
+| `idNo` | Yes* | Candidate ID number, used as the session ID when `sessionId` is absent. |
+| `userId` | No | User ID. Defaults to `idNo`, then `sessionId`. |
+| `lang` | No | UI language (see [Language](#language)). |
+| `debug` | No | `true` to enable debug mode. |
+
+\* One of `sessionId` or `idNo` is required.
+
+### Building for Deployment
+
+```bash
+npm run build:dev    # development API
+npm run build:sit    # SIT API
+npm run build:prod   # production API
+```
+
+`npm run build` (no suffix) builds in `development` mode and uses `.env.development`. This is what Vercel runs by default. Use `npm run build:prod` for production.
+
+Output is written to `dist/`. Preview a build locally with:
+
+```bash
+npm run preview
+```
+
 ## Features
 
 - **Real-time webcam monitoring** — uses the candidate's webcam feed for continuous, on-device analysis for the duration of the exam session. No footage is analyzed server-side; detection runs entirely in the browser.
@@ -66,8 +134,9 @@ postMessage `message` below are always English, regardless of `lang`.
 Every violation is reported to two independent destinations, both driven from the same `eventType`
 value (`getEventTypeFromDetectionType` in [src/App.tsx](src/App.tsx)) so they always agree:
 
-- **Backend API** — `POST https://proctor-x-api.appricode.net/api/proctor/event` with
-  `{ sessionId, timestamp, eventType }`.
+- **Backend API** — `POST {VITE_API_BASE_URL}/proctor/event` with
+  `{ sessionId, timestamp, eventType }`. The base URL depends on the build mode (see
+  [Environment Configuration](#environment-configuration)).
 - **Host application** — `window.parent.postMessage({ type: 'violation', eventType, message }, '*')`,
   sent from [src/lib/parentMessenger.ts](src/lib/parentMessenger.ts). The host listens with
   `window.addEventListener('message', ...)` and reads `event.data.eventType` /

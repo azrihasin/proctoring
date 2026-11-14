@@ -1,11 +1,12 @@
 import { useEffect, useRef } from 'react'
 import * as faceapi from '@vladmandic/face-api'
+import { API_BASE_URL } from '@/lib/config'
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 const MODEL_URL = '/models'
-const KYC_URL = 'https://proctor-x-api.appricode.net/api/kyc/getPhoto'
+const KYC_URL = `${API_BASE_URL}/kyc/getPhoto`
 const VIDEO_ELEMENT_ID = 'proctoring-video'
 
 // face-api descriptors are compared with Euclidean distance (the metric

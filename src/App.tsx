@@ -13,6 +13,7 @@ import { getLangFromUrl, STRINGS } from '@/lib/i18n'
 import { Layers, Check, Download, X } from 'lucide-react'
 import axios from 'axios'
 import { useFaceProctoring } from '@/proctoring/useFaceProctoring'
+import { API_BASE_URL } from '@/lib/config'
 // import EKYC from '@/components/EKYC'
 
 type DetectionType = 'potential_prohibited_object' | 'multiple_faces' | 'face_not_visible' | 'tab_switch' | 'wrong_face' | 'eyes_off_screen' | null
@@ -463,7 +464,7 @@ export default function App() {
       console.log('📝 Log event sent to API:', body)
 
       // Send to real API endpoint
-      const response = await fetch('https://proctor-x-api.appricode.net/api/proctor/event', {
+      const response = await fetch(`${API_BASE_URL}/proctor/event`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -606,7 +607,7 @@ export default function App() {
     }
 
     try {
-      const url = "https://proctor-x-api.appricode.net/api/proctor/upload"
+      const url = `${API_BASE_URL}/proctor/upload`
 
       // Format timestamps as ISO string without milliseconds (e.g., "2025-12-30T19:34:50")
       const startTimeStr = startTime.toISOString().slice(0, 19)
