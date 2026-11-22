@@ -14,10 +14,19 @@ const VIDEO_ELEMENT_ID = 'proctoring-video'
 // < 0.5, a different person is typically > 0.6. Cosine similarity is NOT a
 // reliable metric here because the descriptors are not normalized — different
 // people routinely score 0.85–0.95, so a mismatch would never be flagged.
-const DISTANCE_THRESHOLD = 0.6 // above => mismatch
+// 0.6 is face-api's same-person boundary (the dlib model was trained to keep
+// each identity within a 0.6 radius), so the same candidate with a turned head,
+// different lighting or an older KYC photo often lands just above it. For
+// flagging a DIFFERENT person, mismatch sits above that with a buffer:
+// borderline 0.6–0.7 readings are not penalized. Tune with real distances.
+const DISTANCE_THRESHOLD = 0.7 // above => mismatch
 const GRACE_OPEN_COUNT = 5 // consecutive mismatching ticks required to open
 const RESOLVE_COUNT = 3 // consecutive matching ticks required to resolve
 const TICK_INTERVAL_MS = 1000 // run a comparison every 1 second
+// After the tab becomes visible again, wait this long before comparing. While
+// hidden, comparisons are skipped entirely: that period is already covered by
+// the tab_switch violation, and readings are slowed (tfjs readback ~1s/op).
+const VISIBLE_RESUME_GRACE_MS = 3000
 
 export interface FaceProctoringParams {
   sessionId: string | null
@@ -132,6 +141,7 @@ export function useFaceProctoring({ sessionId, onMismatch, onMatch, onStatus }: 
   const belowCountRef = useRef(0) // consecutive mismatching ticks
   const aboveCountRef = useRef(0) // consecutive matching ticks
   const tickRunningRef = useRef(false)
+  const resumeAfterRef = useRef(0) // no comparisons before this timestamp (post-visibility grace)
 
   // Keep the latest callbacks in refs so the long-lived interval always calls
   // the current versions without needing to restart the effect.
@@ -162,8 +172,21 @@ export function useFaceProctoring({ sessionId, onMismatch, onMatch, onStatus }: 
       return el
     }
 
+    // Hidden: drop any partial count so readings from before and after the
+    // switch can't add up. Visible again: hold off for VISIBLE_RESUME_GRACE_MS.
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        belowCountRef.current = 0
+        aboveCountRef.current = 0
+      } else {
+        resumeAfterRef.current = Date.now() + VISIBLE_RESUME_GRACE_MS
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+
     const tick = async () => {
       if (tickRunningRef.current) return // avoid overlapping ticks
+      if (document.hidden || Date.now() < resumeAfterRef.current) return
       tickRunningRef.current = true
       try {
         const baseline = kycDescriptorRef.current
@@ -171,10 +194,13 @@ export function useFaceProctoring({ sessionId, onMismatch, onMatch, onStatus }: 
         const video = getVideo()
         if (!video) return
 
-        // MediaPipe already guarantees exactly one face is present here, so we
-        // only need the descriptor — no face-count / face-absence checks.
+        // NOTE: this does not consult MediaPipe — it compares whichever face
+        // face-api's SSD detector finds. Face count / absence are handled by
+        // the MediaPipe violations in App.tsx.
         const descriptor = await extractDescriptor(video)
         if (!descriptor) return // descriptor occasionally unavailable; skip this tick
+        // The tab may have been hidden while the descriptor was computing.
+        if (document.hidden) return
 
         const distance = euclideanDistance(descriptor, baseline)
         const isMismatch = distance > DISTANCE_THRESHOLD
@@ -259,6 +285,7 @@ export function useFaceProctoring({ sessionId, onMismatch, onMatch, onStatus }: 
 
     return () => {
       cancelled = true
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
       if (intervalId) clearInterval(intervalId)
       kycDescriptorRef.current = null
       openRef.current = false

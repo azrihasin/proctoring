@@ -101,6 +101,34 @@ npm run preview
 
 Each violation type is tracked independently, with its own on-screen warning, log entry, recorded clip, and reported event.
 
+## Violation Episodes
+
+A violation that keeps being detected is one **episode**. It stays open through short dropouts
+(a detection flickering off for a frame or two). It closes only after the violation has not been
+detected for the type's **episode gap**. The next detection after that starts a new episode.
+
+Each episode produces exactly **1** log line, **1** toast, **1** parent postMessage, **1** `/event`
+and **1** clip. The clip is 10s long from the moment of detection (`VIOLATION_CLIP_DURATION_MS`).
+Episodes have no maximum length: an episode lasts from the first detection to the last detection
+plus the gap.
+
+| Violation | Starts after | Episode gap (ends after) | Episode length | What counts as "still detected" |
+|---|---|---|---|---|
+| **Possible phone usage** | 2 frames in a row with phone score ≥ 0.42, plus 800ms debounce | **3s** | First detection → last phone frame + 3s. **Min 3s**, no max | Any single frame with phone score ≥ 0.42, even one not confirmed |
+| **Face not visible** | 150ms with no face (armed after a 3s camera warm-up at exam start) | **3s** | First detection → last no-face frame + 3s. **Min ~3s**, no max | Every frame with no face |
+| **Multiple faces** | 150ms with more than 1 face | **3s** | First detection → last multi-face frame + 3s. **Min ~3s**, no max | Every frame with more than 1 face |
+| **Head turned away** | \|yaw − resting yaw\| ≥ 25° for 1s in total (stays turned until back under 20°; the count resets after 0.5s facing the screen). Resting yaw = median of the first ~1s of frames, clamped to ±10° | **3s** | First held-turn frame → last held-turn frame + 3s. **Min ~3s**, no max | Every turned frame **after** the 1s hold is reached (a shorter glance does not extend the episode) |
+| **Tab switch** | Immediately when the tab is hidden | **3s**, counted from **leaving** the tab | **Always 3s**, however long the candidate stays away. Only extended if they leave again within those 3s | Only the moment of leaving |
+| **Face mismatch** | 5 mismatch readings in a row (distance > 0.7, 1 reading/s, so about 5s) | **60s** | First reported mismatch → last reported mismatch + 60s. **Min 60s**, no max | Every mismatch reading while the mismatch is open (closes after 3 matches in a row, but the episode stays open until 60s) |
+| Eyes off screen | disabled (`ENABLE_EYES_OFF_SCREEN = false`) | 3s | — | — |
+
+The gaps are `EPISODE_GAP_MS` (3s) and `WRONG_FACE_EPISODE_GAP_MS` (60s) in
+[src/App.tsx](src/App.tsx). Face-mismatch thresholds are in
+[src/proctoring/useFaceProctoring.ts](src/proctoring/useFaceProctoring.ts).
+
+The violation entry in the on-screen list has its own window: it starts 10s before detection and
+ends 10s after the last detection.
+
 ## Detection Models
 
 Detection runs entirely client-side in [src/App.tsx](src/App.tsx), using three independently loaded
@@ -125,6 +153,21 @@ hosts; Lite3+ is not published). Lite2 replaced the previously-used Lite0 after 
 observed on lower-quality webcams/lighting, where Lite0's confidence scores fell under the 0.42
 threshold for real phones.
 
+### Face mismatch check
+
+The wrong-face check ([src/proctoring/useFaceProctoring.ts](src/proctoring/useFaceProctoring.ts))
+compares the candidate's live webcam face with their KYC selfie once every second
+(`TICK_INTERVAL_MS = 1000`). On each check, face-api.js detects the face in the current video frame,
+computes its face descriptor and measures the Euclidean distance to the KYC selfie's descriptor. A
+distance above 0.7 (`DISTANCE_THRESHOLD`) counts as a mismatch and 0.7 or below counts as a match. A
+check is skipped, and counts as neither a match nor a mismatch, when the previous check is still
+running (so on slower devices readings can arrive about every 2 seconds), when the tab is hidden or
+became visible less than 3 seconds ago, when the video is not ready, or when no face is found in the
+frame. A face mismatch incident opens after 5 consecutive mismatches (`GRACE_OPEN_COUNT`). Every
+further mismatch keeps the same incident open and restarts its 60-second countdown
+(`WRONG_FACE_EPISODE_GAP_MS`), so a new "Face Mismatch Detected" incident can be logged only after
+60 seconds with no mismatch reading.
+
 ## Language
 
 On-screen alerts (warning toast, camera errors) follow the `lang` URL parameter:
@@ -145,10 +188,9 @@ value (`getEventTypeFromDetectionType` in [src/App.tsx](src/App.tsx)) so they al
   `window.addEventListener('message', ...)` and reads `event.data.eventType` /
   `event.data.message`.
 
-Both use the same per-type cooldown (`VIOLATION_COOLDOWN_MS`, 30s, reset once the violation has been
-gone for `EPISODE_GAP_MS`, 3s), so a detection that flickers on and off produces **one** postMessage
-and one toast, not one per flicker. The postMessage is sent immediately and never waits for the API
-response.
+Both are sent once per violation episode (see [Violation Episodes](#violation-episodes)), so a
+detection that flickers on and off produces **one** postMessage and one toast, not one per flicker.
+The postMessage is sent immediately and never waits for the API response.
 
 | Violation (`DetectionType`) | Sent to API (`eventType` in POST body) | `eventType` in postMessage | `message` in postMessage |
 |---|---|---|---|
@@ -158,3 +200,4 @@ response.
 | Tab Switch Detected (`tab_switch`) | `tab-switch` | `tab-switch` | `Tab Switch` |
 | Face Mismatch (`wrong_face`) | `face-mismatch` | `face-mismatch` | `Face Mismatch` |
 | Eyes Off Screen (`eyes_off_screen`) | `eyes-off-screen` | `eyes-off-screen` | `Looking Away` |
+| Head Turned Away (`head_turned`) | `head-turned` | `head-turned` | `Head Turned Away` |

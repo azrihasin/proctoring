@@ -20,6 +20,7 @@ export type ViolationLabelKey =
   | 'tab_switch'
   | 'wrong_face'
   | 'eyes_off_screen'
+  | 'head_turned'
   | 'default'
 
 type Strings = {
@@ -45,6 +46,7 @@ export const STRINGS: Record<Lang, Strings> = {
       tab_switch: 'Tab Switch',
       wrong_face: 'Face Mismatch',
       eyes_off_screen: 'Looking Away',
+      head_turned: 'Head Turned Away',
       default: 'Violation',
     },
     cameraAccessError: 'Camera Access Error',
@@ -64,6 +66,7 @@ export const STRINGS: Record<Lang, Strings> = {
       tab_switch: 'Pertukaran Tab',
       wrong_face: 'Wajah Tidak Sepadan',
       eyes_off_screen: 'Tidak Melihat Skrin',
+      head_turned: 'Pandangan Beralih',
       default: 'Pelanggaran',
     },
     cameraAccessError: 'Ralat Akses Kamera',

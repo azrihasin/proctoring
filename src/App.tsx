@@ -4,19 +4,18 @@ import Webcam from 'react-webcam'
 import { useReactMediaRecorder } from 'react-media-recorder'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
-import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
 import { VideoPreview } from '@/components/VideoPreview'
 import { fixWebmMetadata, cn } from '@/lib/utils'
 import { sendEventToParent } from '@/lib/parentMessenger'
 import { getLangFromUrl, STRINGS } from '@/lib/i18n'
-import { Layers, Check, Download, X } from 'lucide-react'
+import { Layers, Check, Download, X, Loader2 } from 'lucide-react'
 import axios from 'axios'
 import { useFaceProctoring } from '@/proctoring/useFaceProctoring'
 import { API_BASE_URL } from '@/lib/config'
 // import EKYC from '@/components/EKYC'
 
-type DetectionType = 'potential_prohibited_object' | 'multiple_faces' | 'face_not_visible' | 'tab_switch' | 'wrong_face' | 'eyes_off_screen' | null
+type DetectionType = 'potential_prohibited_object' | 'multiple_faces' | 'face_not_visible' | 'tab_switch' | 'wrong_face' | 'eyes_off_screen' | 'head_turned' | null
 
 type DetectionHistoryEntry = {
   type: DetectionType
@@ -31,6 +30,20 @@ type ViolationEntry = {
   startTime: Date // violationTime - 10 seconds
   endTime: Date // violationTime + 10 seconds
   score?: number
+}
+
+// Debug-log line. `timer` (violations only, not phone) counts down to when the
+// same violation can be recorded again (its episode closes), shown on ?debug=true.
+type LogTimer = {
+  type: DetectionType
+  remainingMs: number // time left until the episode closes (held at the full gap while still detected)
+  ready: boolean // episode closed: the next detection of this type is recorded again
+}
+
+type LogEntry = {
+  id: number
+  text: string
+  timer?: LogTimer
 }
 
 type SavedVideo = {
@@ -54,6 +67,13 @@ const VIOLATION_COOLDOWN_MS = 30000 // 30 seconds
 // duplicate event/upload, while detection of the FIRST frame stays immediate.
 const EPISODE_GAP_MS = 3000 // 3 seconds
 
+// Episode gap for wrong_face. Face-mismatch readings arrive once a second and the
+// checker needs 3 matching readings to close + 5 mismatching to reopen (>= 8s),
+// so the generic 3s gap ended the episode on every match/mismatch flip — each
+// flip became a new event + clip + penalty. A borderline candidate flipping for
+// minutes stays ONE incident until no mismatch has been seen for this long.
+const WRONG_FACE_EPISODE_GAP_MS = 60000 // 60 seconds
+
 // Camera warm-up grace at exam start. The exam auto-starts the moment the webcam
 // stream is granted, but the first frames are often black/dark/blurry while the
 // camera adjusts exposure and focus, so the face detector sees 0 faces and
@@ -66,6 +86,43 @@ const FACE_NOT_VISIBLE_STARTUP_GRACE_MS = 3000 // 3 seconds
 // Kill switch for eyes_off_screen (looking-away) detection. Disabled for now;
 // set to true to re-enable. Other face/phone detections are unaffected.
 const ENABLE_EYES_OFF_SCREEN = false
+
+// Kill switch for head_turned: a clear left/right HEAD turn only (head yaw
+// from the FaceLandmarker transformation matrix). Independent of
+// ENABLE_EYES_OFF_SCREEN; ignores iris gaze and head up/down, which were the
+// noisy parts of eye detection.
+const ENABLE_HEAD_TURN = true
+// Turned = |yaw - resting yaw| at/past this. Reading anywhere on a laptop screen
+// moves the head only ~5-15 deg (the eyes do the rest), while looking at notes,
+// a phone or a second monitor beside the screen takes ~30-60 deg. 25 deg catches
+// partial side turns that 35 deg missed, with margin over normal screen reading.
+const HEAD_TURN_YAW_LIMIT_DEG = 25
+// Hysteresis: once turned, it stays turned until back under this, so a head
+// held near the limit doesn't flicker in and out.
+const HEAD_TURN_RELEASE_DEG = 20
+const HEAD_TURN_HOLD_MS = 1000 // accumulated turned-away time before firing
+// A turned head makes the detectors flicker for a frame or two. The hold
+// accumulator only clears after facing the screen (or no single face) has
+// persisted this long, so a flicker pauses the count instead of restarting it.
+const HEAD_TURN_RESET_GRACE_MS = 500
+// Resting yaw calibration: the MEDIAN yaw of the first frames with one face
+// (at exam start and after a recalibration). The old single-frame seed caught
+// whatever pose that one frame had, and the slow EMA then took ~5-10s to
+// recover, so one side went undetected right after the exam started.
+const HEAD_TURN_CALIBRATION_SAMPLES = 10 // ~1s of frames
+const HEAD_TURN_BASELINE_SEED_CLAMP_DEG = 10 // a turned pose during calibration can't become "facing the screen"
+// After calibration the resting yaw follows the candidate slowly, but only from
+// frames well inside the limit, and never more than MAX_DRIFT from the
+// calibrated value — so it can't be crept sideways to hide a turn. ADAPT_ZONE
+// is wider than SEED_CLAMP so a candidate who was turned during calibration
+// (seed off by up to 10 deg) is still pulled back once they face the screen;
+// with both limits, an off-center camera up to ~20 deg is absorbed.
+const HEAD_TURN_ADAPT_ZONE_DEG = 12
+const HEAD_TURN_ADAPT_RATE = 0.03
+const HEAD_TURN_BASELINE_MAX_DRIFT_DEG = 10
+// Resting yaw is dropped (recalibrated) only after the single-face view has
+// been gone this long, i.e. the candidate left or repositioned.
+const HEAD_TURN_BASELINE_RESET_MS = 10000
 
 // Lifecycle of a recorded item in the list:
 // - 'pending'  : violation just detected, the 10s clip is still being recorded
@@ -123,6 +180,17 @@ export default function App() {
   // only while the candidate is clearly on-screen, so a real look-away never
   // pulls the baseline toward itself.
   const gazeBaselineRef = useRef<{ yaw: number; pitch: number; gazeH: number; gazeV: number } | null>(null)
+  // head_turned state. Yaw is scored as deviation from the candidate's own
+  // resting yaw (median-calibrated, clamped, EMA-updated only while facing the
+  // screen), so a camera mounted off to one side doesn't read as a permanent turn.
+  const headTurnBaselineYawRef = useRef<number | null>(null)
+  const headTurnCalibratedYawRef = useRef<number | null>(null) // calibrated resting yaw; the baseline may drift only HEAD_TURN_BASELINE_MAX_DRIFT_DEG from it
+  const headTurnCalibSamplesRef = useRef<number[]>([]) // yaw samples collected while calibrating
+  const headTurnIsTurnedRef = useRef(false) // hysteresis state (enter at YAW_LIMIT, leave under RELEASE)
+  const headTurnAccumMsRef = useRef(0) // Accumulated turned-away ms; only turned frames add
+  const headTurnLastFrameAtRef = useRef<number | null>(null) // Previous turned frame time, for the accumulator delta
+  const headTurnNoFaceSinceRef = useRef<number | null>(null) // First moment faceCount stopped being exactly 1; resting yaw drops after HEAD_TURN_BASELINE_RESET_MS
+  const headTurnGraceStartRef = useRef<number | null>(null) // First moment of continuous facing/no-face evidence; accumulator clears only after this persists
   const isDetectingRef = useRef<boolean>(false) // Guard against overlapping detection cycles
   const lastTimingLogRef = useRef<number>(0) // Throttle for frame-timing diagnostics
   const faceDetectorRef = useRef<FaceDetector | null>(null)
@@ -140,6 +208,7 @@ export default function App() {
   const activeTabSwitchViolationRef = useRef<number | null>(null) // Index of active tab_switch violation in violations array
   const activeWrongFaceViolationRef = useRef<number | null>(null) // Index of active wrong_face violation in violations array
   const activeEyesOffScreenViolationRef = useRef<number | null>(null) // Index of active eyes_off_screen violation in violations array
+  const activeHeadTurnedViolationRef = useRef<number | null>(null) // Index of active head_turned violation in violations array
 
   // UI language for on-screen alerts — ?lang=ms or ?lang=en (default English).
   // See src/lib/i18n.ts; API/parent payloads stay in English.
@@ -192,7 +261,13 @@ export default function App() {
   // type was seen, so we only close the episode (resetEventDetectionCount) after
   // the violation has been absent for longer than the grace period.
   const lastSeenRef = useRef<Map<DetectionType, number>>(new Map()) // type -> last detection time
-  
+  // Index (in the violations array) of the entry opened for the CURRENT episode of
+  // each type. A detection that flickers off for a frame closes the active*Ref, but
+  // while the episode is still open addViolation reopens this same entry instead of
+  // logging a new violation — so each episode gives exactly 1 log + toast + parent
+  // message + event + clip. Cleared by the episode sweep when the episode ends.
+  const episodeViolationIndexRef = useRef<Map<DetectionType, number>>(new Map())
+
   // Exam recording state
   const [isExamActive, setIsExamActive] = useState(false)
   const isExamActiveRef = useRef(false) // Ref to avoid stale closures
@@ -282,6 +357,8 @@ export default function App() {
   const showPersonOverlayRef = useRef(false)
   const showPhoneOverlayRef = useRef(false)
   const showEyesOverlayRef = useRef(false)
+  const [showHeadTurnOverlay, setShowHeadTurnOverlay] = useState(false)
+  const showHeadTurnOverlayRef = useRef(false)
   const [isOverlayMenuOpen, setIsOverlayMenuOpen] = useState(false)
   const overlayMenuRef = useRef<HTMLDivElement>(null)
 
@@ -290,6 +367,7 @@ export default function App() {
   useEffect(() => { showPersonOverlayRef.current = showPersonOverlay }, [showPersonOverlay])
   useEffect(() => { showPhoneOverlayRef.current = showPhoneOverlay }, [showPhoneOverlay])
   useEffect(() => { showEyesOverlayRef.current = showEyesOverlay }, [showEyesOverlay])
+  useEffect(() => { showHeadTurnOverlayRef.current = showHeadTurnOverlay }, [showHeadTurnOverlay])
 
   // Close the overlay checkbox menu when clicking anywhere outside it.
   useEffect(() => {
@@ -302,11 +380,38 @@ export default function App() {
     document.addEventListener('mousedown', handleClickOutside)
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [isOverlayMenuOpen])
-  const [logEntries, setLogEntries] = useState<string[]>([])
+  const [logEntries, setLogEntries] = useState<LogEntry[]>([])
+  const logEntryIdRef = useRef(0)
   const [isViewVisible] = useState(true) // Toggle visibility for camera, log, and recorded list (toggle button hidden from UI)
   // Log Section is hidden by default; pass ?debug=true in the URL to display it
   const [isDebugMode] = useState(() => new URLSearchParams(window.location.search).get('debug') === 'true')
-  
+
+  // Debug log timers: every 200ms, count each open timer down to when its
+  // violation can be recorded again. That is the moment the episode-gap sweep
+  // closes the episode (EPISODE_GAP_MS / WRONG_FACE_EPISODE_GAP_MS after the
+  // last detection), which also clears the log/event/clip cooldowns. While the
+  // violation is still detected, the countdown holds at the full gap. Only runs
+  // on ?debug=true while a timer is open.
+  const hasOpenLogTimer = isDebugMode && logEntries.some(e => e.timer && !e.timer.ready)
+  useEffect(() => {
+    if (!hasOpenLogTimer) return
+    const intervalId = window.setInterval(() => {
+      const now = Date.now()
+      setLogEntries(prev => prev.map(entry => {
+        const timer = entry.timer
+        if (!timer || timer.ready) return entry
+        const lastSeen = lastSeenRef.current.get(timer.type)
+        if (lastSeen === undefined || !isExamActiveRef.current) {
+          return { ...entry, timer: { ...timer, remainingMs: 0, ready: true } }
+        }
+        const gapMs = timer.type === 'wrong_face' ? WRONG_FACE_EPISODE_GAP_MS : EPISODE_GAP_MS
+        const remainingMs = Math.max(0, gapMs - (now - lastSeen))
+        return remainingMs === timer.remainingMs ? entry : { ...entry, timer: { ...timer, remainingMs } }
+      }))
+    }, 200)
+    return () => clearInterval(intervalId)
+  }, [hasOpenLogTimer])
+
   // Recorded videos list
   const [recordedVideos, setRecordedVideos] = useState<RecordedVideo[]>([])
 
@@ -321,7 +426,7 @@ export default function App() {
   }, [hasPendingVideos])
 
   // Refs for auto-scrolling
-  const logSectionRef = useRef<HTMLTextAreaElement>(null)
+  const logSectionRef = useRef<HTMLDivElement>(null)
   const recordingListRef = useRef<HTMLDivElement>(null)
 
   // Log when recorded videos changes
@@ -329,12 +434,14 @@ export default function App() {
     // Removed console.log statements
   }, [recordedVideos])
 
-  // Auto-scroll log section to bottom when new entries are added
+  // Auto-scroll log section to bottom when new entries are added (keyed on the
+  // newest entry id, so the 200ms timer ticks don't yank the scroll position).
+  const lastLogEntryId = logEntries.length > 0 ? logEntries[logEntries.length - 1].id : 0
   useEffect(() => {
     if (logSectionRef.current) {
       logSectionRef.current.scrollTop = logSectionRef.current.scrollHeight
     }
-  }, [logEntries])
+  }, [lastLogEntryId])
 
   // Auto-scroll recording list to bottom when new videos are added
   useEffect(() => {
@@ -499,6 +606,8 @@ export default function App() {
       return 'face-mismatch'
     } else if (messageLower.includes('eyes off screen') || messageLower.includes('eyes-off-screen')) {
       return 'eyes-off-screen'
+    } else if (messageLower.includes('head turned') || messageLower.includes('head-turned')) {
+      return 'head-turned'
     }
     return null
   }, [])
@@ -517,6 +626,8 @@ export default function App() {
       return 'face-mismatch'
     } else if (detectionType === 'eyes_off_screen') {
       return 'eyes-off-screen'
+    } else if (detectionType === 'head_turned') {
+      return 'head-turned'
     }
     return null
   }, [])
@@ -540,7 +651,8 @@ export default function App() {
   // the message text only for the generic/unknown-type path.
   // Returns true only when the entry was actually logged (exam active and outside
   // the cooldown window) — callers use this to gate the toast/parent notification.
-  const addLogEntry = useCallback((message: string, eventTypeOverride?: string | null): boolean => {
+  // timerType, when given, attaches a live duration timer to the debug log line.
+  const addLogEntry = useCallback((message: string, eventTypeOverride?: string | null, timerType?: DetectionType): boolean => {
     // Only add logs when exam is active
     if (!isExamActiveRef.current) {
       return false
@@ -577,7 +689,14 @@ export default function App() {
     })
     const logMessage = `${timestamp} ${message}`
     console.log(`🚨 ${logMessage}`)
-    setLogEntries(prev => [...prev.slice(-99), logMessage]) // Keep last 100 entries
+    const entry: LogEntry = {
+      id: ++logEntryIdRef.current,
+      text: logMessage,
+      timer: timerType
+        ? { type: timerType, remainingMs: timerType === 'wrong_face' ? WRONG_FACE_EPISODE_GAP_MS : EPISODE_GAP_MS, ready: false }
+        : undefined,
+    }
+    setLogEntries(prev => [...prev.slice(-99), entry]) // Keep last 100 entries
 
     // Send the violation event to the API at most once per cooldown window per
     // event type. (The matching video clip is uploaded on the same cooldown,
@@ -780,6 +899,7 @@ export default function App() {
       activeMultipleFacesViolationRef.current = null // Reset active multiple_faces violation
       activeTabSwitchViolationRef.current = null // Reset active tab_switch violation
       activeWrongFaceViolationRef.current = null // Reset active wrong_face violation
+      lastSeenRef.current.delete('wrong_face') // Start with no open wrong_face episode
       activeEyesOffScreenViolationRef.current = null // Reset active eyes_off_screen violation
       faceNotVisibleSinceRef.current = null // Reset the face_not_visible gating timer (may be stale from pre-exam frames)
       multipleFacesSinceRef.current = null // Reset the multiple_faces gating timer
@@ -789,6 +909,15 @@ export default function App() {
       eyesOnGraceStartRef.current = null
       noSingleFaceSinceRef.current = null
       gazeBaselineRef.current = null // Recalibrate resting posture at exam start
+      activeHeadTurnedViolationRef.current = null // Reset active head_turned violation
+      headTurnBaselineYawRef.current = null // Recalibrate resting yaw at exam start
+      headTurnCalibratedYawRef.current = null
+      headTurnCalibSamplesRef.current = []
+      headTurnIsTurnedRef.current = false
+      headTurnAccumMsRef.current = 0
+      headTurnLastFrameAtRef.current = null
+      headTurnGraceStartRef.current = null
+      headTurnNoFaceSinceRef.current = null
       examVideoChunksRef.current = []
       lastSavedSegmentTimeRef.current = Date.now()
 
@@ -809,6 +938,7 @@ export default function App() {
       lastEventSentRef.current.clear()
       lastVideoUploadRef.current.clear()
       lastSeenRef.current.clear()
+      episodeViolationIndexRef.current.clear()
 
       // NO exam video segments - NO periodic recording
     } catch (error) {
@@ -940,6 +1070,7 @@ export default function App() {
       lastEventSentRef.current.clear()
       lastVideoUploadRef.current.clear()
       lastSeenRef.current.clear()
+      episodeViolationIndexRef.current.clear()
 
       // No final exam video to save - only violation recordings are saved
 
@@ -966,11 +1097,11 @@ export default function App() {
       return
     }
 
-    // Cooldown: a violation fires on every detection frame while it persists, so
-    // don't start (and later upload) a fresh clip if we already recorded one for
-    // this type within the cooldown window. Caps uploads at one clip per window.
-    const lastUpload = lastVideoUploadRef.current.get(violationType) || 0
-    if (Date.now() - lastUpload < VIOLATION_COOLDOWN_MS) {
+    // One clip per episode: a violation fires on every detection frame while it
+    // persists, so once this episode has a clip, don't record another. The episode
+    // sweep clears the entry when the episode ends, so a new occurrence gets a
+    // fresh clip (matching its one log line / event).
+    if (lastVideoUploadRef.current.has(violationType)) {
       return
     }
 
@@ -1012,6 +1143,7 @@ export default function App() {
                                     violationType === 'tab_switch' ? 'tab_switch_detection' :
                                     violationType === 'wrong_face' ? 'wrong_face_detection' :
                                     violationType === 'eyes_off_screen' ? 'eyes_off_screen_detection' :
+                                    violationType === 'head_turned' ? 'head_turned_detection' :
                                     'violation'
     const pendingFilename = `${pendingViolationTypeStr}_${pendingTimestamp}.${pendingExt}`
     const pendingId = addPendingRecordedVideo(pendingFilename, pendingExt)
@@ -1115,6 +1247,7 @@ export default function App() {
                                    currentViolationType === 'tab_switch' ? 'tab_switch_detection' :
                                    currentViolationType === 'wrong_face' ? 'wrong_face_detection' :
                                    currentViolationType === 'eyes_off_screen' ? 'eyes_off_screen_detection' :
+                                   currentViolationType === 'head_turned' ? 'head_turned_detection' :
                                    'violation'
           const baseFilename = `${violationTypeStr}_${timestamp}`
 
@@ -1144,7 +1277,8 @@ export default function App() {
             'multiple_faces': 'multiple-faces',
             'tab_switch': 'tab-switch',
             'wrong_face': 'face-mismatch',
-            'eyes_off_screen': 'eyes-off-screen'
+            'eyes_off_screen': 'eyes-off-screen',
+            'head_turned': 'head-turned'
           }
           const eventType = eventTypeMap[currentViolationType] || currentViolationType || 'unknown'
 
@@ -1248,7 +1382,7 @@ export default function App() {
   // Add violation to list when detected
   const addViolation = useCallback((type: DetectionType, score?: number) => {
     // For face_not_visible, potential_prohibited_object, multiple_faces, and tab_switch, track as duration - update existing or create new
-    if (type === 'face_not_visible' || type === 'potential_prohibited_object' || type === 'multiple_faces' || type === 'tab_switch' || type === 'wrong_face' || type === 'eyes_off_screen') {
+    if (type === 'face_not_visible' || type === 'potential_prohibited_object' || type === 'multiple_faces' || type === 'tab_switch' || type === 'wrong_face' || type === 'eyes_off_screen' || type === 'head_turned') {
       const activeRef = type === 'face_not_visible'
         ? activeFaceNotVisibleViolationRef
         : type === 'potential_prohibited_object'
@@ -1259,7 +1393,16 @@ export default function App() {
         ? activeTabSwitchViolationRef
         : type === 'wrong_face'
         ? activeWrongFaceViolationRef
+        : type === 'head_turned'
+        ? activeHeadTurnedViolationRef
         : activeEyesOffScreenViolationRef
+
+      // Same episode still open (the detection only flickered off): reopen its
+      // entry instead of starting a new violation, so no second log/notification.
+      const episodeIndex = episodeViolationIndexRef.current.get(type)
+      if (activeRef.current === null && episodeIndex !== undefined) {
+        activeRef.current = episodeIndex
+      }
 
       // Decided OUTSIDE the state updater: React may run an updater more than once
       // (StrictMode always does in dev), so side effects inside it would fire twice.
@@ -1303,6 +1446,9 @@ export default function App() {
         const newViolations = [...prev, violation]
         // Set the active index to the new violation
         activeRef.current = newViolations.length - 1
+        // Only a real new episode records its index; a stale reopen (entry gone)
+        // just gets a fresh entry without a new log.
+        if (startsNewViolation) episodeViolationIndexRef.current.set(type, activeRef.current)
 
         return newViolations
       })
@@ -1321,11 +1467,14 @@ export default function App() {
           ? 'Face Mismatch Detected'
           : type === 'eyes_off_screen'
           ? 'Possible Looking Away Violation'
+          : type === 'head_turned'
+          ? 'Head Turned Away Detected'
           : 'Violation Detected'
         // Authoritative eventType for this violation — the SAME value used for the
         // DB event (sendLogToAPI) and the parent postMessage, so both stay in sync.
         const eventType = getEventTypeFromDetectionType(type)
-        const logged = addLogEntry(violationMessage, eventType)
+        // Debug log timer for every violation except phone detection.
+        const logged = addLogEntry(violationMessage, eventType, type === 'potential_prohibited_object' ? undefined : type)
 
         // A flickering detection (e.g. the face lost for a few frames, back for
         // one) starts a "new" violation on every flicker. Only notify when the
@@ -1347,6 +1496,8 @@ export default function App() {
             ? 'Face Mismatch'
             : type === 'eyes_off_screen'
             ? 'Looking Away'
+            : type === 'head_turned'
+            ? 'Head Turned Away'
             : 'Violation'
           pushWarningToast(type, t.violations[type ?? 'default'] ?? t.violations.default)
 
@@ -1459,9 +1610,14 @@ export default function App() {
     // the gap is treated fresh.
     const nowEpisodeSweep = Date.now()
     for (const [type, lastSeen] of lastSeenRef.current.entries()) {
-      if (nowEpisodeSweep - lastSeen > EPISODE_GAP_MS) {
+      const episodeGap = type === 'wrong_face' ? WRONG_FACE_EPISODE_GAP_MS : EPISODE_GAP_MS
+      if (nowEpisodeSweep - lastSeen > episodeGap) {
         resetEventDetectionCount(type)
         lastSeenRef.current.delete(type)
+        episodeViolationIndexRef.current.delete(type) // next detection = new violation, logged again
+        // wrong_face keeps its violation entry open across match/mismatch flips
+        // (see handleWrongFaceMatch); only now is the episode really over.
+        if (type === 'wrong_face') activeWrongFaceViolationRef.current = null
       }
     }
 
@@ -1840,8 +1996,30 @@ export default function App() {
             examStartedAtRef.current === null ||
             Date.now() - examStartedAtRef.current >= FACE_NOT_VISIBLE_STARTUP_GRACE_MS
 
+          // FaceLandmarker runs at most ONCE per frame and is shared by
+          // head_turned and eyes_off_screen (a second detectForVideo with the
+          // same timestamp would throw on non-monotonic input).
+          // It runs on 0 OR 1 BlazeFace faces: in VIDEO mode it tracks the face
+          // frame to frame, so it keeps a head turned past ~40 deg that
+          // BlazeFace short-range drops. Gated on faceCount === 1 (as before),
+          // a head turn read as 0 faces -> face_not_visible, and head_turned
+          // never saw the turn.
+          let landmarkResult: ReturnType<FaceLandmarker['detectForVideo']> | null = null
+          if ((ENABLE_HEAD_TURN || ENABLE_EYES_OFF_SCREEN) && faceCount <= 1 && !currentDetection && faceLandmarkerRef.current) {
+            try {
+              landmarkResult = faceLandmarkerRef.current.detectForVideo(video, startTimeMs)
+            } catch (lmError) {
+              console.error('Error during FaceLandmarker detection:', lmError)
+            }
+          }
+          const landmarkerSeesFace = (landmarkResult?.faceLandmarks?.length ?? 0) > 0
+          // A face the landmarker is still tracking is a visible (turned) face.
+          const faceVisible = faceCount > 0 || landmarkerSeesFace
+          // Exactly one face available for head pose.
+          const singleFaceForPose = faceCount === 1 || (faceCount === 0 && landmarkerSeesFace)
+
           // Check for face not visible (time-based; only if nothing higher-priority detected)
-          if (faceCount === 0 && !currentDetection && faceNotVisibleArmed) {
+          if (!faceVisible && !currentDetection && faceNotVisibleArmed) {
             lastSeenRef.current.set('face_not_visible', Date.now())
             if (faceNotVisibleSinceRef.current === null) faceNotVisibleSinceRef.current = Date.now()
 
@@ -1859,7 +2037,7 @@ export default function App() {
               }
               addViolation('face_not_visible', 0)
             }
-          } else if (faceCount > 0) {
+          } else if (faceVisible) {
             faceNotVisibleSinceRef.current = null
             if (activeFaceNotVisibleViolationRef.current !== null) {
               setViolations(prev => {
@@ -1880,12 +2058,165 @@ export default function App() {
             }
           }
 
+          // --- head_turned: clear left/right head turn (only when exactly ONE face) ---
+          // Head yaw only: no iris gaze, no up/down. Fires after
+          // HEAD_TURN_HOLD_MS of accumulated turned-away time.
+          if (ENABLE_HEAD_TURN) {
+            const nowHt = Date.now()
+            const matrix = landmarkResult?.facialTransformationMatrixes?.[0]?.data
+            let isTurned = false
+            if (matrix) {
+              // Same extraction as eyes_off_screen (column-major 4x4).
+              // +yaw = head turned to the subject's right.
+              const headYaw = Math.atan2(matrix[2], Math.sqrt(matrix[6] * matrix[6] + matrix[10] * matrix[10])) * (180 / Math.PI)
+
+              // Calibrate the resting yaw from the median of the first
+              // HEAD_TURN_CALIBRATION_SAMPLES frames (~1s). A brief glance in
+              // that window can't move a median; a turn held through all of
+              // it is capped by the seed clamp.
+              if (headTurnBaselineYawRef.current === null) {
+                headTurnCalibSamplesRef.current.push(headYaw)
+                if (headTurnCalibSamplesRef.current.length >= HEAD_TURN_CALIBRATION_SAMPLES) {
+                  const sorted = [...headTurnCalibSamplesRef.current].sort((a, b) => a - b)
+                  const mid = Math.floor(sorted.length / 2)
+                  const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+                  const seed = Math.max(-HEAD_TURN_BASELINE_SEED_CLAMP_DEG, Math.min(HEAD_TURN_BASELINE_SEED_CLAMP_DEG, median))
+                  headTurnBaselineYawRef.current = seed
+                  headTurnCalibratedYawRef.current = seed
+                  headTurnCalibSamplesRef.current = []
+                }
+              }
+              const isCalibrating = headTurnBaselineYawRef.current === null
+              // While calibrating (~1s), score against 0 (camera in front) so a
+              // turn at exam start is still caught.
+              const restYaw = headTurnBaselineYawRef.current ?? 0
+              const dYaw = headYaw - restYaw
+              // Hysteresis: enter at the limit, leave only under the release angle.
+              isTurned = headTurnIsTurnedRef.current
+                ? Math.abs(dYaw) >= HEAD_TURN_RELEASE_DEG
+                : Math.abs(dYaw) >= HEAD_TURN_YAW_LIMIT_DEG
+              headTurnIsTurnedRef.current = isTurned
+
+              if (isTurned) {
+                headTurnGraceStartRef.current = null
+                const last = headTurnLastFrameAtRef.current
+                headTurnAccumMsRef.current += last === null ? 0 : Math.min(250, nowHt - last)
+                headTurnLastFrameAtRef.current = nowHt
+
+                if (headTurnAccumMsRef.current >= HEAD_TURN_HOLD_MS) {
+                  // Only a real (held) turn keeps the episode alive. A short
+                  // glance under HEAD_TURN_HOLD_MS no longer extends the 3s
+                  // cooldown, so the next real turn after it is logged again.
+                  lastSeenRef.current.set('head_turned', nowHt)
+                  const turnScore = Math.abs(dYaw) / HEAD_TURN_YAW_LIMIT_DEG
+                  currentDetection = 'head_turned'
+                  latestDetectionScoreRef.current = { type: 'head_turned', score: turnScore }
+                  const streamToUse = getMediaStream()
+                  const examIsActive = isExamActiveRef.current || isExamActive
+                  if (examIsActive && streamToUse) {
+                    startViolationRecording(streamToUse, new Date(), 'head_turned').catch((error) => {
+                      console.error('Error starting violation recording:', error)
+                    })
+                  }
+                  addViolation('head_turned', turnScore)
+                }
+              } else if (!isCalibrating && Math.abs(dYaw) < HEAD_TURN_ADAPT_ZONE_DEG && headTurnCalibratedYawRef.current !== null) {
+                // Facing the screen: slowly track the resting yaw (only well
+                // inside the limit, so a turn never trains the baseline), and
+                // never further than MAX_DRIFT from the calibrated value, so
+                // small repeated sideways moves can't creep it toward a turn.
+                const calibrated = headTurnCalibratedYawRef.current
+                const next = restYaw + HEAD_TURN_ADAPT_RATE * (headYaw - restYaw)
+                headTurnBaselineYawRef.current = Math.max(
+                  calibrated - HEAD_TURN_BASELINE_MAX_DRIFT_DEG,
+                  Math.min(calibrated + HEAD_TURN_BASELINE_MAX_DRIFT_DEG, next)
+                )
+              }
+
+              // Debug HUD (overlay menu: "Head turn detection").
+              if (showHeadTurnOverlayRef.current) {
+                const boxW = 250
+                const boxX = videoWidth - boxW - 10
+                const boxY = ENABLE_EYES_OFF_SCREEN && showEyesOverlayRef.current ? 140 : 10
+                ctx.fillStyle = isTurned ? 'rgba(200,0,0,0.75)' : 'rgba(0,140,60,0.75)'
+                ctx.fillRect(boxX, boxY, boxW, 66)
+                ctx.fillStyle = '#ffffff'
+                ctx.font = 'bold 16px Arial'
+                ctx.fillText(isTurned ? `HEAD TURNED ${dYaw > 0 ? 'RIGHT' : 'LEFT'}` : 'HEAD FACING SCREEN', boxX + 10, boxY + 22)
+                ctx.font = '13px Arial'
+                ctx.fillText(
+                  isCalibrating
+                    ? `yaw ${dYaw.toFixed(0)}° / ${HEAD_TURN_YAW_LIMIT_DEG}°  (calibrating ${headTurnCalibSamplesRef.current.length}/${HEAD_TURN_CALIBRATION_SAMPLES})`
+                    : `yaw ${dYaw.toFixed(0)}° / ${HEAD_TURN_YAW_LIMIT_DEG}°  (rest ${restYaw.toFixed(0)}°)`,
+                  boxX + 10, boxY + 42
+                )
+                ctx.fillText(`held ${Math.round(headTurnAccumMsRef.current)}ms / ${HEAD_TURN_HOLD_MS}ms`, boxX + 10, boxY + 60)
+              }
+            } else if (showHeadTurnOverlayRef.current) {
+              // No head pose this frame: still show the HUD, with the reason,
+              // so "nothing on screen" never hides why detection is idle.
+              const reason = !faceLandmarkerRef.current ? 'landmarker not loaded'
+                : faceCount > 1 ? 'multiple faces'
+                : currentDetection ? `paused: ${currentDetection}`
+                : 'no face landmarks'
+              const boxW = 250
+              const boxX = videoWidth - boxW - 10
+              const boxY = ENABLE_EYES_OFF_SCREEN && showEyesOverlayRef.current ? 140 : 10
+              ctx.fillStyle = 'rgba(90,90,90,0.75)'
+              ctx.fillRect(boxX, boxY, boxW, 48)
+              ctx.fillStyle = '#ffffff'
+              ctx.font = 'bold 16px Arial'
+              ctx.fillText('HEAD TURN: NO POSE', boxX + 10, boxY + 22)
+              ctx.font = '13px Arial'
+              ctx.fillText(reason, boxX + 10, boxY + 40)
+            }
+
+            // Not turned (facing the screen, no single face, or no landmarks
+            // this frame): close the active entry and start the reset grace.
+            if (!isTurned) {
+              if (headTurnGraceStartRef.current === null) headTurnGraceStartRef.current = nowHt
+              if (nowHt - headTurnGraceStartRef.current >= HEAD_TURN_RESET_GRACE_MS) {
+                headTurnAccumMsRef.current = 0
+                headTurnLastFrameAtRef.current = null
+                headTurnIsTurnedRef.current = false // no pose for a while: next turn needs the full limit again
+              }
+              if (activeHeadTurnedViolationRef.current !== null) {
+                setViolations(prev => {
+                  const activeIndex = activeHeadTurnedViolationRef.current
+                  if (activeIndex !== null && prev[activeIndex] && prev[activeIndex].type === 'head_turned') {
+                    const updated = [...prev]
+                    updated[activeIndex] = {
+                      ...updated[activeIndex],
+                      endTime: new Date(Date.now() + 10000) // +10 seconds after detection ends
+                    }
+                    return updated
+                  }
+                  return prev
+                })
+                activeHeadTurnedViolationRef.current = null
+                // Episode close deferred to the EPISODE_GAP_MS sweep.
+              }
+            }
+
+            // Candidate genuinely left / repositioned: recalibrate resting yaw.
+            if (singleFaceForPose) {
+              headTurnNoFaceSinceRef.current = null
+            } else {
+              if (headTurnNoFaceSinceRef.current === null) headTurnNoFaceSinceRef.current = nowHt
+              if (nowHt - headTurnNoFaceSinceRef.current >= HEAD_TURN_BASELINE_RESET_MS) {
+                headTurnBaselineYawRef.current = null
+                headTurnCalibratedYawRef.current = null
+                headTurnCalibSamplesRef.current = []
+              }
+            }
+          }
+
           // --- eyes_off_screen: head-pose + eye-gaze (only when exactly ONE face) ---
           // The FaceLandmarker runs only for the normal single-face case, so it
           // adds no per-frame cost while a higher-priority face-count violation is
           // active, and the !currentDetection guard keeps it below potential_prohibited_object.
           if (faceCount === 1) noSingleFaceSinceRef.current = null
-          if (ENABLE_EYES_OFF_SCREEN && faceCount === 1 && !currentDetection && faceLandmarkerRef.current) {
+          if (ENABLE_EYES_OFF_SCREEN && faceCount === 1 && !currentDetection && landmarkResult) {
             let isEyesOff = false
             let offMagnitude = 0
             let requiredHoldMs = EYES_OFF_SCREEN_HORIZONTAL_MS
@@ -1895,7 +2226,7 @@ export default function App() {
             let hudGaze = 0
             let hudGazeV = 0
             try {
-              const lmResult = faceLandmarkerRef.current.detectForVideo(video, startTimeMs)
+              const lmResult = landmarkResult
 
               // Head pose from the 4x4 facial transformation matrix (column-major:
               // R[row][col] === data[col*4 + row]). Standard Tait-Bryan extraction.
@@ -2354,11 +2685,16 @@ export default function App() {
     // Only act while an exam is in progress (mirrors the other detections).
     if (!isExamActiveRef.current) return
 
+    // A mismatch that reopens within WRONG_FACE_EPISODE_GAP_MS belongs to the
+    // same episode — no new clip (the event is suppressed too, because the
+    // violation entry is still active and addViolation just extends it).
+    const isNewEpisode = !lastSeenRef.current.has('wrong_face')
+
     // Keep the wrong-face episode alive while the mismatch persists.
     lastSeenRef.current.set('wrong_face', Date.now())
 
-    // Start the 10-second violation recording (deduped per type while active).
-    const streamToUse = getMediaStream()
+    // Start the 10-second violation recording once per episode.
+    const streamToUse = isNewEpisode ? getMediaStream() : null
     if (streamToUse) {
       const detectionTime = new Date()
       startViolationRecording(streamToUse, detectionTime, 'wrong_face').catch((error) => {
@@ -2386,8 +2722,9 @@ export default function App() {
       }
       return prev
     })
-    activeWrongFaceViolationRef.current = null
-    // Episode close deferred to the EPISODE_GAP_MS sweep.
+    // Keep activeWrongFaceViolationRef set: if the mismatch reopens within
+    // WRONG_FACE_EPISODE_GAP_MS, addViolation extends this same entry instead of
+    // logging a new violation/event. The sweep clears it when the episode ends.
   }, [])
 
   useFaceProctoring({
@@ -2476,6 +2813,7 @@ export default function App() {
       lastEventSentRef.current.clear()
       lastVideoUploadRef.current.clear()
       lastSeenRef.current.clear()
+      episodeViolationIndexRef.current.clear()
       
       // Stop all media stream tracks
       if (mediaStreamRef.current) {
@@ -2623,7 +2961,7 @@ export default function App() {
               <div className="relative" ref={overlayMenuRef}>
                 <Button
                   onClick={() => setIsOverlayMenuOpen((open) => !open)}
-                  variant={showPersonOverlay || showPhoneOverlay || showEyesOverlay ? 'default' : 'secondary'}
+                  variant={showPersonOverlay || showPhoneOverlay || showEyesOverlay || showHeadTurnOverlay ? 'default' : 'secondary'}
                   size="icon"
                   title="Toggle detection overlays"
                   aria-haspopup="true"
@@ -2640,6 +2978,7 @@ export default function App() {
                       { label: 'Person detection', checked: showPersonOverlay, toggle: () => setShowPersonOverlay((v) => !v) },
                       { label: 'Phone usage detection', checked: showPhoneOverlay, toggle: () => setShowPhoneOverlay((v) => !v) },
                       { label: 'Eye looking away detection', checked: showEyesOverlay, toggle: () => setShowEyesOverlay((v) => !v) },
+                      { label: 'Head turn detection', checked: showHeadTurnOverlay, toggle: () => setShowHeadTurnOverlay((v) => !v) },
                     ] as const).map((item) => (
                       <button
                         key={item.label}
@@ -2665,13 +3004,41 @@ export default function App() {
               </div>
             </CardHeader>
             <CardContent className="p-4 flex-1 flex flex-col">
-              <Textarea
+              {/* Violation lines (except phone) carry a countdown to when the
+                  same violation can be recorded again: spinner while counting
+                  (held at the full gap while still detected), "ready" after. */}
+              <div
                 ref={logSectionRef}
-                readOnly
-                value={logEntries.join('\n')}
-                className="h-full max-h-[300px] [field-sizing:fixed] font-mono text-xs overflow-y-auto resize-none"
-                placeholder="Log entries will appear here..."
-              />
+                className="h-[300px] w-full overflow-y-auto rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"
+              >
+                {logEntries.length === 0 ? (
+                  <span className="text-muted-foreground">Log entries will appear here...</span>
+                ) : (
+                  logEntries.map((entry) => {
+                    const timer = entry.timer
+                    const isRunning = timer !== undefined && !timer.ready
+                    return (
+                      <div key={entry.id} className="flex items-center gap-2 whitespace-pre-wrap leading-5">
+                        <span>{entry.text}</span>
+                        {timer && (
+                          <span
+                            className={cn(
+                              'inline-flex items-center gap-1 tabular-nums',
+                              isRunning ? 'text-amber-600' : 'text-muted-foreground'
+                            )}
+                            title={isRunning
+                              ? 'Time until this violation can be recorded again (holds while still detected)'
+                              : 'This violation will be recorded again on its next detection'}
+                          >
+                            {isRunning ? <Loader2 className="h-3 w-3 animate-spin" /> : <Check className="h-3 w-3" />}
+                            {isRunning ? `next in ${(timer.remainingMs / 1000).toFixed(1)}s` : 'ready'}
+                          </span>
+                        )}
+                      </div>
+                    )
+                  })
+                )}
+              </div>
             </CardContent>
           </div>
         )}
