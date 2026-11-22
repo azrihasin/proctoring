@@ -26,6 +26,7 @@ The backend API base URL is set at build time through `VITE_API_BASE_URL`. Each 
 |---|---|---|
 | `.env.development` | `development` | `https://proctor-dev.cidb.gov.my/api` |
 | `.env.sit` | `sit` | `https://proctor-sit.cidb.gov.my/api` |
+| `.env.stg` | `stg` | `https://proctor-stg.cidb.gov.my/api` |
 | `.env.production` | `production` | `https://proctor.cidb.gov.my/api` |
 
 An environment variable of the same name set in the shell or on the hosting platform (e.g. Vercel) takes precedence over the file. If `VITE_API_BASE_URL` is missing, the app throws on startup.
@@ -35,6 +36,7 @@ An environment variable of the same name set in the shell or on the hosting plat
 ```bash
 npm run dev        # development API
 npm run dev:sit    # SIT API
+npm run dev:stg    # staging API
 npm run dev:prod   # production API
 ```
 
@@ -59,6 +61,7 @@ http://localhost:5173/?sessionId=<session-id>&userId=<user-id>
 ```bash
 npm run build:dev    # development API
 npm run build:sit    # SIT API
+npm run build:stg    # staging API
 npm run build:prod   # production API
 ```
 

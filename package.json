@@ -6,10 +6,12 @@
   "scripts": {
     "dev": "vite",
     "dev:sit": "vite --mode sit",
+    "dev:stg": "vite --mode stg",
     "dev:prod": "vite --mode production",
     "build": "tsc && vite build --mode development",
     "build:dev": "tsc && vite build --mode development",
     "build:sit": "tsc && vite build --mode sit",
+    "build:stg": "tsc && vite build --mode stg",
     "build:prod": "tsc && vite build --mode production",
     "preview": "vite preview"
   },
